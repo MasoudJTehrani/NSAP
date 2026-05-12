@@ -1,3 +1,36 @@
+# --- NSAP project ---
+# Dataset (annotations, masks, videos, frames — all large)
+dataset/
+
+# Downloaded model weights and source
+model/
+
+# Cloned external repos (LASER, etc.)
+src/
+
+# Checkpoints (GroundingDINO, SAM2)
+checkpoints/
+
+# Large file types
+*.safetensors
+*.pkl
+*.pt
+*.pth
+*.ckpt
+*.bin
+*.h5
+*.hdf5
+*.tar.gz
+*.zip
+*.mp4
+*.webm
+*.mkv
+*.avi
+*.mov
+# *.jpg
+# *.jpeg
+# *.png
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]

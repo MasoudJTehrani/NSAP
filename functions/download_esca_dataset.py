@@ -19,6 +19,8 @@ ROOT = Path(__file__).resolve().parent.parent
 DATASET_DIR = ROOT / "dataset"
 DATASET_DIR.mkdir(parents=True, exist_ok=True)
 
+MASKS_SENTINEL = DATASET_DIR / ".masks_extracted"
+
 REPO_ID = "video-fm/ESCA-video-87K"
 
 ANNOTATION_FILES = [
@@ -26,12 +28,6 @@ ANNOTATION_FILES = [
     "gpt_specs2_id_LLaVA_all.jsonl",
     "neg_examples.jsonl",
 ]
-
-ARCHIVE_FILES = [
-    "mini_LLaVA_10000_masks.tar.gz",
-    *[f"chunk_{i:03d}.tar.gz" for i in range(44)],
-]
-
 
 HF_TOKEN = os.environ.get("HF_TOKEN")
 
@@ -62,7 +58,7 @@ def _download_file(hf, filename: str) -> Path:
     return Path(path)
 
 
-def _extract(archive: Path) -> None:
+def _extract(archive: Path, cleanup: bool = False) -> None:
     print(f"  Extracting {archive.name} ...")
     with tarfile.open(archive, "r:gz") as tf:
         members = tf.getmembers()
@@ -72,9 +68,17 @@ def _extract(archive: Path) -> None:
                 pct = i / len(members) * 100
                 print(f"\r  {pct:5.1f}%  ({i}/{len(members)} files)", end="", flush=True)
     print(f"\r  Done: {len(members)} files extracted from {archive.name}.")
+    if cleanup:
+        archive.unlink()
+        print(f"  Deleted {archive.name} to save space.")
 
 
-def main(download_videos: bool = False, extract_masks: bool = False) -> None:
+def main(download_chunks: bool = False, cleanup: bool = False) -> None:
+    """
+    download_chunks: download all 44 video chunk archives (~33 GB compressed).
+                     Use download_videos.py instead for a selective yt-dlp download.
+    cleanup:         delete archives after extraction to save space.
+    """
     hf = _require_hf_hub()
     if HF_TOKEN:
         print("HF_TOKEN found — using authenticated requests.")
@@ -88,36 +92,29 @@ def main(download_videos: bool = False, extract_masks: bool = False) -> None:
         _download_file(hf, fname)
 
     print("\n=== Mask subset ===")
-    archive = _download_file(hf, "mini_LLaVA_10000_masks.tar.gz")
-    if extract_masks:
-        _extract(archive)
-        answer = input(f"\n  Delete {archive.name} to save space? [y/N] ").strip().lower()
-        if answer == "y":
-            archive.unlink()
-            print(f"  Deleted {archive.name}")
+    if MASKS_SENTINEL.exists():
+        print("  Already extracted — skipping.")
     else:
-        print("  Skipping extraction (pass extract_masks=True or --extract-masks flag to extract).")
+        archive = _download_file(hf, "mini_LLaVA_10000_masks.tar.gz")
+        _extract(archive, cleanup=cleanup)
+        MASKS_SENTINEL.touch()
 
-    if download_videos:
+    if download_chunks:
         print("\n=== Video chunks (44 files, ~33 GB) ===")
         for fname in [f"chunk_{i:03d}.tar.gz" for i in range(44)]:
             archive = _download_file(hf, fname)
-            _extract(archive)
-            answer = input(f"\n  Delete {archive.name}? [y/N] ").strip().lower()
-            if answer == "y":
-                archive.unlink()
-                print(f"  Deleted {fname}")
+            _extract(archive, cleanup=cleanup)
     else:
-        print("\nSkipping video chunks (run with --videos flag to include them).")
+        print("\nSkipping video chunks. Use functions/download_videos.py for selective yt-dlp download.")
 
     print("\nAll done. Dataset is in:", DATASET_DIR)
 
 
 if __name__ == "__main__":
-    include_videos = "--videos" in sys.argv
-    include_masks = "--extract-masks" in sys.argv
+    include_chunks = "--chunks" in sys.argv
+    do_cleanup = "--cleanup" in sys.argv
     try:
-        main(download_videos=include_videos, extract_masks=include_masks)
+        main(download_chunks=include_chunks, cleanup=do_cleanup)
     except KeyboardInterrupt:
         print("\nInterrupted.")
         sys.exit(1)
