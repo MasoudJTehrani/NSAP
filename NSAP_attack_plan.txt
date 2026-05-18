@@ -1,0 +1,429 @@
+================================================================================
+NSAP — Neuro-Symbolic Adversarial Patch
+Full Implementation Plan
+================================================================================
+Date: 2026-05-18
+Author: Masoud J. Tehrani
+Model under attack: VINE / LASER (video-fm/vine, ICLR 2025)
+Dataset: ESCA-video-87K
+
+
+--------------------------------------------------------------------------------
+1. PROJECT GOAL
+--------------------------------------------------------------------------------
+Design and implement a universal adversarial patch that disrupts VINE's video
+scene graph generation. The patch is trained once per target category and tested
+across multiple video clips. Three isolated attack modes are supported:
+
+  (A) Category attack   — make VINE misclassify an object (e.g. table → not table)
+  (B) Attribute attack  — make VINE assign the wrong attribute (e.g. red → not red)
+  (C) Relation attack   — make VINE assign the wrong spatial relation (e.g. next
+                          to → not next to)
+
+Isolation means: attacking one head should not noticeably disturb the other two.
+
+Attack type:     White-box (full gradient access to model weights)
+Attack strategy: Untargeted (suppress current correct prediction; we do not
+                 prescribe what the wrong prediction should be)
+
+
+--------------------------------------------------------------------------------
+2. VINE ARCHITECTURE RECAP (relevant to attack design)
+--------------------------------------------------------------------------------
+VINE (PredicateModel) contains three independently trained CLIP encoders:
+
+  clip_cate_model   — category classification
+  clip_unary_model  — attribute / unary predicate classification
+  clip_binary_model — binary relation classification
+
+For each detected object in a frame:
+  1. A binary segmentation mask is applied to the frame. The object region
+     keeps its original pixels; the background is blended 80% toward white.
+  2. The result is hard-cropped to the object's bounding box.
+  3. This single-object crop is fed to BOTH clip_cate_model and clip_unary_model.
+
+For each pair of detected objects (relation):
+  1. Object 1 (subject) receives a red tint; object 2 (object) receives a blue tint;
+     background is blended 80% toward white.
+  2. The result is hard-cropped to the UNION bounding box of both objects.
+  3. This pair crop is fed to clip_binary_model.
+
+Prediction mechanism (all three heads, identical):
+  score(label, crop) = cosine_similarity(text_embed(label), image_embed(crop))
+                       × exp(logit_scale)
+  probabilities       = softmax(scores) over the provided label list
+
+Key implication: gradients flow from similarity scores → CLIP image encoder →
+crop pixels → frame pixels. Any patch pixels that fall inside a bounding box
+receive non-zero gradients. Pixels outside all bounding boxes receive zero
+gradients and will never be updated.
+
+
+--------------------------------------------------------------------------------
+3. PATCH DESIGN
+--------------------------------------------------------------------------------
+
+3.1 Placement
+  The patch is pasted at the CENTER of the target object's bounding box in
+  each frame. It does not extend outside the bounding box.
+
+  Coverage ratio (default 0.3): controls how much of the bbox the patch covers.
+    patch_w = coverage_ratio × bbox_width
+    patch_h = coverage_ratio × bbox_height
+
+  This is exposed as a variable (attack hyperparameter) so experiments can test
+  different coverage levels.
+
+  [CHANGE FROM INITIAL IDEA]
+  The user initially proposed holding the patch "outside the frame" and letting
+  training determine where to place it. This is not feasible because VINE
+  processes only bounding-box crops — any pixel outside all bounding boxes
+  never enters the CLIP forward pass and receives zero gradient. The patch would
+  learn nothing. Centering the patch inside the target bbox guarantees the patch
+  pixels are part of the computation graph on every forward pass.
+
+3.2 Universal patch
+  One patch tensor is trained per attack mode and per target category
+  (e.g., one patch for attacking "person" category, a separate one for
+  "cup" attribute). The same patch is applied to every instance of that
+  category across all videos during evaluation.
+
+  This is the standard universal adversarial patch paradigm (Brown et al. 2017).
+  During training, each gradient update is computed on a different instance
+  (different video, different frame), so the patch is forced to generalize rather
+  than memorize one specific instance.
+
+3.3 Patch parameterization (tanh)
+  The patch is not stored directly as pixel values. Instead, an unconstrained
+  tensor w is optimized, and pixels are derived as:
+
+    patch_pixels = 127.5 × (tanh(w) + 1)      (range [0, 255] automatically)
+
+  [CHANGE FROM INITIAL IDEA]
+  The user initially mentioned PGD-style updates, which require projecting the
+  patch back into [0, 255] after each gradient step. Projection introduces
+  discontinuities in the optimization landscape (the gradient "bounces" off the
+  boundary). The tanh parameterization achieves the same pixel-range constraint
+  but keeps the optimization smooth end-to-end — there is no projection step
+  at all. Adam then operates on the unbounded w, which is numerically cleaner.
+
+
+--------------------------------------------------------------------------------
+4. OPTIMIZATION
+--------------------------------------------------------------------------------
+
+4.1 Optimizer: Adam
+  Learning rate: 0.01 (tunable)
+  Parameters:   beta1=0.9, beta2=0.999 (PyTorch defaults)
+
+  [CHANGE FROM INITIAL IDEA]
+  The user initially mentioned PGD / FGSM as the update rule. These are
+  sign-based methods — every gradient dimension gets the same magnitude update
+  regardless of how strong the gradient signal is. With three loss terms
+  (attack + chameleon + preservation) having very different scales and gradient
+  magnitudes, sign-based updates would be dominated by whichever term has the
+  largest raw gradient, making λ tuning fragile and chameleon quality poor.
+
+  Adam's per-parameter adaptive learning rate naturally balances all three terms:
+  it normalizes each dimension by its historical gradient magnitude, so a weak
+  chameleon gradient is not drowned out by a strong attack gradient. This is
+  empirically validated by CW-style attacks (Carlini & Wagner 2017), which showed
+  Adam significantly outperforms PGD for adversarial optimization with soft
+  constraints.
+
+4.2 Expectation over Transformations (EoT)
+  During each training step, the patch gradient is computed over a batch of K
+  frames sampled from different video clips containing instances of the target
+  category (K=8 default). The gradient is averaged over the batch before the
+  Adam update.
+
+  This is the EoT technique (Athalye et al. 2018). It makes the patch robust to
+  appearance variation across instances and frames. Without EoT, the patch would
+  overfit to the exact lighting, pose, and background of one specific instance and
+  fail on any other frame.
+
+  The user chose to train on 1 frame per instance but batch over many instances —
+  this is equivalent to EoT over appearance variation.
+
+4.3 Training loop (per attack mode)
+  Precompute:
+    1. Collect N crops of the target category from ESCA (N=500 recommended).
+    2. For each crop, extract VGG16 feature maps at layers relu1_2, relu2_2,
+       relu3_3 and compute Gram matrices.
+    3. Average the Gram matrices across all N crops → reference_gram (fixed for
+       the entire training run).
+
+  Per training step:
+    1. Sample a mini-batch of (frame, mask, bbox, category_label) from ESCA
+       where the target category is present.
+    2. Paste the current patch (derived from tanh(w)) at the center of each
+       instance's bounding box.
+    3. Forward pass through VineModel (PredicateModel) on each modified frame.
+    4. Compute total loss (see Section 5).
+    5. Backpropagate through VineModel → crop pixels → patch pixels → w.
+    6. Adam step on w.
+    7. Log current confidence scores on the target head for progress tracking.
+
+  Stopping criteria:
+    - Fixed number of steps (default: 2000)
+    - Early stop if attack success rate on the validation frame exceeds threshold
+
+
+--------------------------------------------------------------------------------
+5. LOSS FUNCTION
+--------------------------------------------------------------------------------
+
+L_total = L_attack  +  λ_c × L_chameleon  +  λ_p × L_preserve
+
+All three terms are described below.
+
+5.1 L_attack (untargeted, on the target head only)
+
+  The goal is to suppress the model's confidence in the correct label. We use the
+  margin loss (CW formulation):
+
+    L_attack = max(0,  score_correct  −  max_{j ≠ correct} score_j  +  κ)
+
+  where κ ≥ 0 is a confidence margin (default κ=0). This loss is zero once the
+  correct class is no longer the top prediction — it does not waste gradient budget
+  continuing to push after the attack has already succeeded.
+
+  Which head is attacked depends on the mode:
+    (A) Category:  uses clip_cate_model scores
+    (B) Attribute: uses clip_unary_model scores
+    (C) Relation:  uses clip_binary_model scores over the pair crop
+
+  All three modes operate on the same mathematical formula; only the CLIP encoder
+  and the input crop differ.
+
+5.2 L_chameleon (visual camouflage)
+
+  Two components:
+
+  (a) Gram matrix style loss:
+      Extract VGG16 feature maps of the patch at layers relu1_2, relu2_2, relu3_3.
+      Compute Gram matrices G_patch at each layer.
+      L_style = sum over layers of  ||G_patch_l  −  reference_gram_l||²_F
+
+  (b) Total variation (smoothness):
+      L_tv = sum of squared differences between adjacent pixels in the patch
+
+  L_chameleon = L_style  +  λ_tv × L_tv     (λ_tv default: 1e-4)
+
+  [CHANGE FROM INITIAL IDEA]
+  The user initially proposed LAB color space distance as the chameleon
+  constraint. LAB distance matches mean color (average hue and lightness) but
+  ignores texture, edge patterns, and frequency content. A patch could pass LAB
+  distance while having artificial noise textures that are visually obvious.
+
+  Gram matrix style loss (Gatys et al. 2016, neural style transfer) captures the
+  statistical co-occurrence of feature activations at multiple spatial scales. This
+  means it matches not just color distribution but also texture patterns
+  (brushstroke-like patterns, fabric weave, hair texture, etc.). For a universal
+  patch that must visually blend with many different instances of a category
+  (all "person" objects across many clips), this generalization of appearance is
+  essential.
+
+  Since the patch is universal (not instance-specific), the reference Gram is the
+  average across many instances of the target category, precomputed once. This
+  is more stable than per-instance LAB distance during training.
+
+  LAB distance is retained as an optional fast alternative for ablation studies.
+
+5.3 L_preserve (isolation of attack to one head)
+
+  For an attack targeting head X, the other two heads Y and Z should be preserved.
+  Preservation loss uses KL divergence between original predictions and attacked
+  predictions:
+
+    L_preserve = mean over batch of [
+        KL( p_Y(original_frame)  ||  p_Y(patched_frame) )
+      + KL( p_Z(original_frame)  ||  p_Z(patched_frame) )
+    ]
+
+  This is a soft constraint — it penalizes deviation from original predictions on
+  the non-attacked heads rather than hard-stopping when they change. The strength
+  is controlled by λ_p (default: 0.5, tunable).
+
+  [CHANGE FROM INITIAL IDEA]
+  The user initially asked whether perfect isolation was possible. The answer is:
+  not guaranteed at the pixel level, because category and attribute share the same
+  input crop. However, since the three CLIP encoders have independently trained
+  weights, a perturbation that fools clip_cate_model does not necessarily fool
+  clip_unary_model. The KL preservation loss guides the optimizer to stay in the
+  subspace of perturbations that exploit only the target head's decision boundary.
+  The degree of isolation is controlled by λ_p.
+
+5.4 Recommended λ starting values
+  λ_c (chameleon):    1.0
+  λ_p (preservation): 0.5
+  λ_tv (smoothness):  1e-4
+  κ    (margin):      0.0
+
+  These should be tuned per attack mode. Relation attacks may need higher λ_p
+  because the pair crop spatially overlaps with the single-object crops.
+
+
+--------------------------------------------------------------------------------
+6. EVALUATION
+--------------------------------------------------------------------------------
+
+6.1 Frame selection
+  VINE natively samples video at target_fps=1 with max_vid_len=10 (from
+  llava_dataset.py). For a 6-second clip → 6 frames; for a 15-second clip →
+  10 frames (further sub-sampled). Evaluation uses these exact same parameters
+  so results reflect real-world model behavior.
+
+6.2 Evaluation procedure
+  For each test video containing an instance of the target category:
+    1. Run VINE on the original frames → record baseline scene graph SG_clean.
+    2. Apply the patch to every frame (same patch, same relative placement).
+    3. Run VINE on the patched frames → record attacked scene graph SG_attacked.
+    4. Compute metrics (see 6.3).
+
+  The test set should be held out from training — different video clips than
+  those used to compute the reference Gram or train the patch.
+
+6.3 Metrics
+
+  (a) Prediction flip rate (per head, per frame):
+      Fraction of frames where the top-1 prediction changed after the patch.
+      Reported separately for each head (category / attribute / relation).
+      This is the headline metric: easy to interpret and directly comparable
+      to baselines.
+
+  (b) Scene graph edit distance:
+      Structural difference between SG_clean and SG_attacked.
+      Captures whether ONLY the attacked head changed and the others stayed
+      stable (proving isolation). Also captures whether the overall scene
+      understanding was disrupted.
+
+      Edit distance operations:
+        - Node label substitution (category changed)
+        - Node attribute substitution (attribute changed)
+        - Edge label substitution (relation changed)
+        - Node insertion / deletion (object appeared or disappeared)
+
+      Reported as:
+        - Total edit distance
+        - Breakdown by operation type (substitution vs. insertion/deletion)
+        - Percentage of attacked head changes vs. collateral changes on
+          preserved heads (isolation score)
+
+6.4 Baseline comparison (category attack only)
+  Compare the universal patch from this work against patches from existing
+  CLIP-based adversarial patch methods (e.g. AdvCLIP, SGA) applied to the same
+  test clips under the same patch coverage budget. Metric: prediction flip rate
+  per frame across consecutive frames.
+
+  The comparison argument: existing CLIP patches are designed for single images or
+  i.i.d. pairs. The patch in this work is trained with EoT over diverse video
+  instances and achieves more consistent flip rate across consecutive frames.
+
+  Relation and attribute attacks are NOT compared to baselines as they are novel
+  contributions (no known prior work attacks these specific heads of a
+  neuro-symbolic video scene graph model).
+
+
+--------------------------------------------------------------------------------
+7. FILE STRUCTURE (implementation)
+--------------------------------------------------------------------------------
+
+NSAP/
+├── NSAP.py                        entry point (existing)
+├── functions/
+│   ├── download_esca_dataset.py   existing
+│   ├── download_videos.py         existing
+│   ├── extract_frames.py          existing
+│   ├── download_model.py          existing
+│   ├── attack/
+│   │   ├── __init__.py
+│   │   ├── patch.py               patch tensor, tanh parameterization, paste logic
+│   │   ├── losses.py              L_attack, L_chameleon (Gram+TV), L_preserve (KL)
+│   │   ├── train.py               training loop, EoT batching, Adam optimizer
+│   │   ├── reference_gram.py      precompute reference Gram from ESCA crops
+│   │   └── data.py                data loader: frames + masks + bboxes from ESCA
+│   └── eval/
+│       ├── __init__.py
+│       ├── scene_graph.py         run VINE on a clip, return scene graph structure
+│       ├── flip_rate.py           compute per-head prediction flip rate
+│       └── edit_distance.py       compute scene graph edit distance
+└── NSAP_attack_plan.txt           this file
+
+
+--------------------------------------------------------------------------------
+8. HYPERPARAMETER SUMMARY
+--------------------------------------------------------------------------------
+
+Patch:
+  coverage_ratio      0.3          (fraction of bbox; tunable)
+  patch_init          random       (uniform noise in tanh space)
+
+Training:
+  optimizer           Adam
+  learning_rate       0.01
+  batch_size          8            (instances per EoT step)
+  num_steps           2000
+  reference_gram_n    500          (instances used to compute reference Gram)
+  vgg_layers          relu1_2, relu2_2, relu3_3
+
+Loss weights:
+  λ_c  (chameleon)    1.0
+  λ_p  (preservation) 0.5
+  λ_tv (smoothness)   1e-4
+  κ    (CW margin)    0.0
+
+Evaluation:
+  target_fps          1
+  max_vid_len         10
+  test_clips          held-out, not used in training or reference Gram computation
+
+Attack modes:
+  category            untargeted, white-box, suppress clip_cate_model top-1
+  attribute           untargeted, white-box, suppress clip_unary_model top-1
+  relation            untargeted, white-box, suppress clip_binary_model top-1
+
+
+--------------------------------------------------------------------------------
+9. DESIGN DECISION SUMMARY (CHANGES FROM INITIAL PROPOSALS)
+--------------------------------------------------------------------------------
+
+Initial proposal → Final decision → Reason
+
+1. Patch outside the frame → Center of target bbox
+   VINE's CLIP encoders only process bounding box crops. Pixels outside all
+   bboxes receive zero gradient. Patch must be inside at least one bbox to learn.
+
+2. PGD / FGSM → Adam + tanh parameterization
+   Sign-based updates cannot balance multiple loss terms with different scales.
+   Adam's adaptive per-parameter learning rate handles the multi-objective loss
+   (attack + chameleon + preservation) without manual gradient normalization.
+   tanh parameterization replaces projection, removing boundary discontinuities.
+
+3. LAB color distance → Gram matrix style loss (VGG)
+   LAB distance matches mean color but ignores texture and frequency content.
+   Gram matrix matching (Gatys et al. 2016) captures statistical texture
+   co-occurrences at multiple scales, producing patches that generalize across
+   the full appearance diversity of a category (essential for universal patch).
+
+4. Per-instance patch → Universal patch per category
+   Prompted by the user's goal of attacking all instances of "person" etc.
+   Universal patches are trained with EoT over many instances, forcing
+   generalization rather than single-instance memorization.
+
+5. Hard isolation of attack heads → Soft isolation via KL preservation loss
+   True pixel-level isolation is not achievable because category and attribute
+   heads share the same input crop. Soft preservation via KL divergence guides
+   the optimizer into the subspace of perturbations that exploit only the target
+   head, achieving practical isolation controlled by λ_p.
+
+6. Training on frames extracted from downloaded videos → Training on ESCA masks
+   ESCA pre-computed masks (mini_LLaVA_10000_masks) already contain per-object
+   segmentation masks aligned with video frames. These can be used directly to
+   extract object crops for the reference Gram computation without re-running
+   GroundingDINO + SAM2.
+
+
+================================================================================
+END OF PLAN
+================================================================================
