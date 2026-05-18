@@ -48,6 +48,11 @@ For each pair of detected objects (relation):
   2. The result is hard-cropped to the UNION bounding box of both objects.
   3. This pair crop is fed to clip_binary_model.
 
+  Color tinting formula (from model_utils.py):
+    Subject (object 1):  r_new = clip(r + (255 − r) × 0.5, 0, 255)  [red boosted]
+    Object  (object 2):  b_new = clip(b + (255 − b) × 0.5, 0, 255)  [blue boosted]
+    Background:          pixel_new = 0.2 × pixel + 0.8 × 255         [80% whitened]
+
 Prediction mechanism (all three heads, identical):
   score(label, crop) = cosine_similarity(text_embed(label), image_embed(crop))
                        × exp(logit_scale)
@@ -64,22 +69,49 @@ gradients and will never be updated.
 --------------------------------------------------------------------------------
 
 3.1 Placement
-  The patch is pasted at the CENTER of the target object's bounding box in
-  each frame. It does not extend outside the bounding box.
 
-  Coverage ratio (default 0.3): controls how much of the bbox the patch covers.
+  Category and attribute attacks:
+    The patch is pasted at the CENTER of the target object's bounding box.
+    It does not extend outside the bounding box. The mask's object region
+    keeps its original pixels (white blending only affects the background),
+    so the patch pixels enter the CLIP forward pass unmodified.
+
+  Relation attack:
+    The patch is pasted at the CENTER of the SUBJECT's (object 1) bounding box.
+    It does not extend outside the subject bbox.
+
+    [WHY NOT CENTER OF UNION BBOX]
+    The union bbox center frequently falls in the spatial gap between the two
+    objects. This gap region receives background treatment in extract_object_subject:
+    pixel_new = 0.2 × pixel + 0.8 × 255. The patch would be only 20% visible
+    to the model, making the attack extremely weak.
+
+    [WHY SUBJECT, NOT OBJECT]
+    The subject (object 1) gets a red tint: r_new = 0.5 × r + 127.5.
+    This is a linear transformation with gradient scale 0.5 — gradient flows
+    through it cleanly. Placing the patch on the subject is a consistent,
+    predictable choice: the subject is the semantic anchor of the relation
+    (e.g. "person" in "person next to table") and is typically the larger,
+    more prominent object.
+
+    [DIFFERENTIABLE PREPROCESSING REQUIREMENT]
+    The current extract_single_object and extract_object_subject functions are
+    implemented in NumPy and break the PyTorch computation graph. For white-box
+    gradient flow to reach the patch, both functions must be re-implemented as
+    differentiable PyTorch operations before the training loop. This is a
+    required implementation step.
+
+  Coverage ratio (default 0.3): controls how much of the subject bbox the
+  patch covers, exposed as a tunable hyperparameter.
     patch_w = coverage_ratio × bbox_width
     patch_h = coverage_ratio × bbox_height
-
-  This is exposed as a variable (attack hyperparameter) so experiments can test
-  different coverage levels.
 
   [CHANGE FROM INITIAL IDEA]
   The user initially proposed holding the patch "outside the frame" and letting
   training determine where to place it. This is not feasible because VINE
   processes only bounding-box crops — any pixel outside all bounding boxes
   never enters the CLIP forward pass and receives zero gradient. The patch would
-  learn nothing. Centering the patch inside the target bbox guarantees the patch
+  learn nothing. Centering the patch inside the subject bbox guarantees the patch
   pixels are part of the computation graph on every forward pass.
 
 3.2 Universal patch
@@ -88,7 +120,7 @@ gradients and will never be updated.
   "cup" attribute). The same patch is applied to every instance of that
   category across all videos during evaluation.
 
-  This is the standard universal adversarial patch paradigm (Brown et al. 2017).
+  This is the standard universal adversarial patch paradigm [1].
   During training, each gradient update is computed on a different instance
   (different video, different frame), so the patch is forced to generalize rather
   than memorize one specific instance.
@@ -127,9 +159,8 @@ gradients and will never be updated.
   Adam's per-parameter adaptive learning rate naturally balances all three terms:
   it normalizes each dimension by its historical gradient magnitude, so a weak
   chameleon gradient is not drowned out by a strong attack gradient. This is
-  empirically validated by CW-style attacks (Carlini & Wagner 2017), which showed
-  Adam significantly outperforms PGD for adversarial optimization with soft
-  constraints.
+  empirically validated by CW-style attacks [2], which showed Adam significantly
+  outperforms PGD for adversarial optimization with soft constraints.
 
 4.2 Expectation over Transformations (EoT)
   During each training step, the patch gradient is computed over a batch of K
@@ -137,10 +168,10 @@ gradients and will never be updated.
   category (K=8 default). The gradient is averaged over the batch before the
   Adam update.
 
-  This is the EoT technique (Athalye et al. 2018). It makes the patch robust to
-  appearance variation across instances and frames. Without EoT, the patch would
-  overfit to the exact lighting, pose, and background of one specific instance and
-  fail on any other frame.
+  This is the EoT technique [3]. It makes the patch robust to appearance
+  variation across instances and frames. Without EoT, the patch would overfit to
+  the exact lighting, pose, and background of one specific instance and fail on
+  any other frame.
 
   The user chose to train on 1 frame per instance but batch over many instances —
   this is equivalent to EoT over appearance variation.
@@ -148,7 +179,7 @@ gradients and will never be updated.
 4.3 Training loop (per attack mode)
   Precompute:
     1. Collect N crops of the target category from ESCA (N=500 recommended).
-    2. For each crop, extract VGG16 feature maps at layers relu1_2, relu2_2,
+    2. For each crop, extract VGG16 [8] feature maps at layers relu1_2, relu2_2,
        relu3_3 and compute Gram matrices.
     3. Average the Gram matrices across all N crops → reference_gram (fixed for
        the entire training run).
@@ -157,12 +188,15 @@ gradients and will never be updated.
     1. Sample a mini-batch of (frame, mask, bbox, category_label) from ESCA
        where the target category is present.
     2. Paste the current patch (derived from tanh(w)) at the center of each
-       instance's bounding box.
-    3. Forward pass through VineModel (PredicateModel) on each modified frame.
-    4. Compute total loss (see Section 5).
-    5. Backpropagate through VineModel → crop pixels → patch pixels → w.
-    6. Adam step on w.
-    7. Log current confidence scores on the target head for progress tracking.
+       instance's bounding box (subject bbox for relation attack).
+    3. Run differentiable PyTorch preprocessing (extract_single_object for
+       category/attribute; extract_object_subject for relation).
+    4. Forward pass through VineModel (PredicateModel) on each modified frame.
+    5. Compute total loss (see Section 5).
+    6. Backpropagate through VineModel → preprocessing → crop pixels →
+       patch pixels → w.
+    7. Adam step on w.
+    8. Log current confidence scores on the target head for progress tracking.
 
   Stopping criteria:
     - Fixed number of steps (default: 2000)
@@ -180,7 +214,7 @@ All three terms are described below.
 5.1 L_attack (untargeted, on the target head only)
 
   The goal is to suppress the model's confidence in the correct label. We use the
-  margin loss (CW formulation):
+  margin loss (CW formulation [2]):
 
     L_attack = max(0,  score_correct  −  max_{j ≠ correct} score_j  +  κ)
 
@@ -201,8 +235,8 @@ All three terms are described below.
   Two components:
 
   (a) Gram matrix style loss:
-      Extract VGG16 feature maps of the patch at layers relu1_2, relu2_2, relu3_3.
-      Compute Gram matrices G_patch at each layer.
+      Extract VGG16 [8] feature maps of the patch at layers relu1_2, relu2_2,
+      relu3_3. Compute Gram matrices G_patch at each layer.
       L_style = sum over layers of  ||G_patch_l  −  reference_gram_l||²_F
 
   (b) Total variation (smoothness):
@@ -216,13 +250,12 @@ All three terms are described below.
   ignores texture, edge patterns, and frequency content. A patch could pass LAB
   distance while having artificial noise textures that are visually obvious.
 
-  Gram matrix style loss (Gatys et al. 2016, neural style transfer) captures the
-  statistical co-occurrence of feature activations at multiple spatial scales. This
-  means it matches not just color distribution but also texture patterns
-  (brushstroke-like patterns, fabric weave, hair texture, etc.). For a universal
-  patch that must visually blend with many different instances of a category
-  (all "person" objects across many clips), this generalization of appearance is
-  essential.
+  Gram matrix style loss [4] captures the statistical co-occurrence of feature
+  activations at multiple spatial scales. This means it matches not just color
+  distribution but also texture patterns (brushstroke-like patterns, fabric
+  weave, hair texture, etc.). For a universal patch that must visually blend with
+  many different instances of a category (all "person" objects across many clips),
+  this generalization of appearance is essential.
 
   Since the patch is universal (not instance-specific), the reference Gram is the
   average across many instances of the target category, precomputed once. This
@@ -310,15 +343,19 @@ All three terms are described below.
         - Percentage of attacked head changes vs. collateral changes on
           preserved heads (isolation score)
 
+      Both metrics are required: flip rate gives a headline number comparable
+      to prior work; edit distance proves that the attack is isolated (e.g.,
+      category changed while attribute and relation remained stable).
+
 6.4 Baseline comparison (category attack only)
   Compare the universal patch from this work against patches from existing
-  CLIP-based adversarial patch methods (e.g. AdvCLIP, SGA) applied to the same
-  test clips under the same patch coverage budget. Metric: prediction flip rate
-  per frame across consecutive frames.
+  CLIP-based adversarial patch methods (AdvCLIP [6], SGA [7]) applied to the
+  same test clips under the same patch coverage budget. Metric: prediction flip
+  rate per frame across consecutive frames.
 
-  The comparison argument: existing CLIP patches are designed for single images or
-  i.i.d. pairs. The patch in this work is trained with EoT over diverse video
-  instances and achieves more consistent flip rate across consecutive frames.
+  The comparison argument: existing CLIP patches are designed for single images
+  or i.i.d. pairs. The patch in this work is trained with EoT [3] over diverse
+  video instances and achieves more consistent flip rate across consecutive frames.
 
   Relation and attribute attacks are NOT compared to baselines as they are novel
   contributions (no known prior work attacks these specific heads of a
@@ -339,6 +376,8 @@ NSAP/
 │   ├── attack/
 │   │   ├── __init__.py
 │   │   ├── patch.py               patch tensor, tanh parameterization, paste logic
+│   │   ├── preprocess.py          differentiable PyTorch versions of
+│   │   │                          extract_single_object and extract_object_subject
 │   │   ├── losses.py              L_attack, L_chameleon (Gram+TV), L_preserve (KL)
 │   │   ├── train.py               training loop, EoT batching, Adam optimizer
 │   │   ├── reference_gram.py      precompute reference Gram from ESCA crops
@@ -356,7 +395,7 @@ NSAP/
 --------------------------------------------------------------------------------
 
 Patch:
-  coverage_ratio      0.3          (fraction of bbox; tunable)
+  coverage_ratio      0.3          (fraction of subject bbox; tunable)
   patch_init          random       (uniform noise in tanh space)
 
 Training:
@@ -381,7 +420,8 @@ Evaluation:
 Attack modes:
   category            untargeted, white-box, suppress clip_cate_model top-1
   attribute           untargeted, white-box, suppress clip_unary_model top-1
-  relation            untargeted, white-box, suppress clip_binary_model top-1
+  relation            untargeted, white-box, suppress clip_binary_model top-1,
+                      patch placed on subject (object 1) bbox center
 
 
 --------------------------------------------------------------------------------
@@ -390,38 +430,101 @@ Attack modes:
 
 Initial proposal → Final decision → Reason
 
-1. Patch outside the frame → Center of target bbox
+1. Patch outside the frame → Center of subject bbox
    VINE's CLIP encoders only process bounding box crops. Pixels outside all
    bboxes receive zero gradient. Patch must be inside at least one bbox to learn.
 
-2. PGD / FGSM → Adam + tanh parameterization
+2. Patch on center of union bbox (relation) → Patch on subject (object 1) bbox
+   The gap between two objects receives background treatment in
+   extract_object_subject (80% whitened), making the patch only 20% visible.
+   Placing the patch on the subject keeps it fully visible in the pair crop
+   (subject region is only red-tinted, not whitened), and gradient flows cleanly
+   through the linear tinting transformation with scale factor 0.5.
+
+3. PGD / FGSM → Adam + tanh parameterization
    Sign-based updates cannot balance multiple loss terms with different scales.
    Adam's adaptive per-parameter learning rate handles the multi-objective loss
    (attack + chameleon + preservation) without manual gradient normalization.
    tanh parameterization replaces projection, removing boundary discontinuities.
 
-3. LAB color distance → Gram matrix style loss (VGG)
+4. LAB color distance → Gram matrix style loss (VGG16)
    LAB distance matches mean color but ignores texture and frequency content.
-   Gram matrix matching (Gatys et al. 2016) captures statistical texture
-   co-occurrences at multiple scales, producing patches that generalize across
-   the full appearance diversity of a category (essential for universal patch).
+   Gram matrix matching [4] captures statistical texture co-occurrences at
+   multiple scales, producing patches that generalize across the full appearance
+   diversity of a category (essential for universal patch).
 
-4. Per-instance patch → Universal patch per category
+5. Per-instance patch → Universal patch per category
    Prompted by the user's goal of attacking all instances of "person" etc.
-   Universal patches are trained with EoT over many instances, forcing
+   Universal patches are trained with EoT [3] over many instances, forcing
    generalization rather than single-instance memorization.
 
-5. Hard isolation of attack heads → Soft isolation via KL preservation loss
+6. Hard isolation of attack heads → Soft isolation via KL preservation loss
    True pixel-level isolation is not achievable because category and attribute
    heads share the same input crop. Soft preservation via KL divergence guides
    the optimizer into the subspace of perturbations that exploit only the target
    head, achieving practical isolation controlled by λ_p.
 
-6. Training on frames extracted from downloaded videos → Training on ESCA masks
+7. NumPy preprocessing (existing VINE code) → Differentiable PyTorch preprocessing
+   extract_single_object and extract_object_subject break the PyTorch computation
+   graph. White-box gradient flow to the patch requires differentiable PyTorch
+   re-implementations of both functions.
+
+8. Training on extracted video frames → Training directly on ESCA masks
    ESCA pre-computed masks (mini_LLaVA_10000_masks) already contain per-object
    segmentation masks aligned with video frames. These can be used directly to
    extract object crops for the reference Gram computation without re-running
    GroundingDINO + SAM2.
+
+
+--------------------------------------------------------------------------------
+10. REFERENCES
+--------------------------------------------------------------------------------
+
+[1] T. B. Brown, D. Mané, A. Roy, M. Abadi, and J. Gilmer,
+    "Adversarial Patch,"
+    arXiv:1712.09665, 2017.
+
+[2] N. Carlini and D. Wagner,
+    "Towards Evaluating the Robustness of Neural Networks,"
+    IEEE Symposium on Security and Privacy (S&P), 2017.
+
+[3] A. Athalye, L. Engstrom, A. Ilyas, and K. Kwok,
+    "Synthesizing Robust Adversarial Examples,"
+    International Conference on Machine Learning (ICML), 2018.
+
+[4] L. A. Gatys, A. S. Ecker, and M. Bethge,
+    "Image Style Transfer Using Convolutional Neural Networks,"
+    IEEE Conference on Computer Vision and Pattern Recognition (CVPR), 2016.
+
+[5] A. Radford, J. W. Kim, C. Hallacy, A. Ramesh, G. Goh, S. Agarwal,
+    G. Krueger, T. Askell, P. Mishkin, J. Clark, G. Brockman, and I. Sutskever,
+    "Learning Transferable Visual Models From Natural Language Supervision,"
+    International Conference on Machine Learning (ICML), 2021.
+
+[6] Z. Zhou, S. Hu, R. Zhao, Q. Wang, L. Y. Zhang, J. Hou, and L. Sun,
+    "AdvCLIP: Downstream-agnostic Adversarial Examples in Multimodal
+    Contrastive Learning,"
+    ACM Conference on Computer and Communications Security (CCS), 2023.
+
+[7] D. Lu, Z. Wang, T. Wang, W. Guan, H. Gao, and F. Zheng,
+    "Set-level Guidance Attack: Boosting Adversarial Transferability of
+    Vision-Language Pre-training Models,"
+    IEEE/CVF International Conference on Computer Vision (ICCV), 2023.
+
+[8] K. Simonyan and A. Zisserman,
+    "Very Deep Convolutional Networks for Large-Scale Image Recognition,"
+    International Conference on Learning Representations (ICLR), 2015.
+
+[9] J. Huang, Z. Li, M. Naik, and S.-N. Lim,
+    "LASER: A Neuro-Symbolic Framework for Learning Spatial-Temporal Scene
+    Graphs with Weak Supervision,"
+    International Conference on Learning Representations (ICLR), 2025.
+    arXiv:2304.07647
+
+[10] J. Huang, A. Sethi, M. Kuo, M. Keoliya, N. Velingker, J. Jung,
+     S.-N. Lim, Z. Li, and M. Naik,
+     "ESCA: Contextualizing Embodied Agents via Scene-Graph Generation,"
+     Neural Information Processing Systems (NeurIPS), 2025. [Spotlight]
 
 
 ================================================================================
