@@ -70,23 +70,53 @@ gradients and will never be updated.
 
 3.1 Placement
 
-  Category and attribute attacks:
-    The patch is pasted at the CENTER of the target object's bounding box.
-    It does not extend outside the bounding box. The mask's object region
-    keeps its original pixels (white blending only affects the background),
-    so the patch pixels enter the CLIP forward pass unmodified.
+  Patch placement follows a two-phase approach: SAM-guided anchor selection
+  (Phase 1, run once before training) followed by fixed-anchor training with
+  stochastic offset (Phase 2).
 
-  Relation attack:
-    The patch is pasted at the CENTER of the SUBJECT's (object 1) bounding box.
-    It does not extend outside the subject bbox.
+  Phase 1 — SAM anchor selection (pre-training, done once per category):
+    1. Sample N=100 representative instances of the target category from ESCA.
+    2. For each instance, run SAM [12] with a bounding-box prompt to obtain
+       sub-region segmentation masks (e.g., for "person": head, torso, legs;
+       for "car": windshield, hood, roof).
+    3. Compute the centroid of each SAM segment → K anchor candidates per instance
+       (K typically equals the number of SAM segments, usually 3–6).
+    4. For each anchor candidate, run a short warm-up (20 gradient steps) with a
+       randomly initialized patch and record the average CW attack loss over
+       the N instances.
+    5. Select the anchor with the highest average attack loss as the universal
+       placement for all training and evaluation.
 
-    [WHY NOT CENTER OF UNION BBOX]
+    [WHY SAM ANCHORS, NOT FIXED CENTER]
+    CLIP's attention is not uniform — different semantic sub-regions of an object
+    contribute unequally to the image embedding. Placing the patch at the bbox
+    center is a geometric heuristic that ignores where the model is actually
+    sensitive. SAM anchor selection empirically finds the sub-region that maximally
+    disrupts the CLIP similarity score, yielding a principled and more effective
+    placement. As a side effect, the selected anchor (e.g., "face" for person,
+    "windshield" for car) is interpretable and constitutes an additional finding
+    about which object sub-regions are most vulnerable.
+
+  Phase 2 — Training placement:
+    The patch is pasted at the SAM-selected anchor location (subject bbox for
+    the relation attack, target object bbox for category and attribute attacks).
+    It does not extend outside the bounding box.
+
+    Stochastic offset during EoT: at each EoT sample, a small random offset
+    (uniform in ±10% of patch size in both x and y) is added to the anchor
+    position before pasting. This makes the patch robust to slight misalignment
+    across frames and generalizes placement within the selected semantic region.
+
+  Relation attack placement:
+    The anchor is selected from SAM segments of the SUBJECT (object 1) bbox.
+    The patch does not extend outside the subject bbox.
+
+    [WHY SUBJECT, NOT OBJECT OR UNION CENTER]
     The union bbox center frequently falls in the spatial gap between the two
     objects. This gap region receives background treatment in extract_object_subject:
     pixel_new = 0.2 × pixel + 0.8 × 255. The patch would be only 20% visible
     to the model, making the attack extremely weak.
 
-    [WHY SUBJECT, NOT OBJECT]
     The subject (object 1) gets a red tint: r_new = 0.5 × r + 127.5.
     This is a linear transformation with gradient scale 0.5 — gradient flows
     through it cleanly. Placing the patch on the subject is a consistent,
@@ -111,8 +141,8 @@ gradients and will never be updated.
   training determine where to place it. This is not feasible because VINE
   processes only bounding-box crops — any pixel outside all bounding boxes
   never enters the CLIP forward pass and receives zero gradient. The patch would
-  learn nothing. Centering the patch inside the subject bbox guarantees the patch
-  pixels are part of the computation graph on every forward pass.
+  learn nothing. SAM-guided anchor selection ensures the patch is placed inside
+  the bounding box at the semantically most vulnerable sub-region.
 
 3.2 Universal patch
   One patch tensor is trained per attack mode and per target category
@@ -173,10 +203,24 @@ gradients and will never be updated.
   the exact lighting, pose, and background of one specific instance and fail on
   any other frame.
 
+  Diversity-aware EoT sampling (DINO-guided):
+  Before training, all instances in the training set are embedded with DINOv2 [11]
+  (CLS token = global scene representation) and clustered into k=20 groups via
+  k-means. During each EoT step, the K instances are sampled to cover diverse
+  clusters rather than sampled uniformly at random. This ensures the mini-batch
+  represents the full distribution of scene contexts and prevents the patch from
+  overfitting to a dominant scene type (e.g., indoor office frames if the dataset
+  is skewed toward that setting).
+
   The user chose to train on 1 frame per instance but batch over many instances —
   this is equivalent to EoT over appearance variation.
 
 4.3 Training loop (per attack mode)
+  Phase 0 — Anchor selection and dataset preparation (run once per category):
+    1. Run SAM anchor selection (Section 3.1, Phase 1) → universal anchor position.
+    2. Embed all training instances with DINOv2 (CLS token) and cluster into
+       k=20 groups for diversity-aware EoT sampling (Section 4.2).
+
   Precompute:
     1. Collect N crops of the target category from ESCA (N=500 recommended).
     2. For each crop, extract VGG16 [8] feature maps at layers relu1_2, relu2_2,
@@ -185,10 +229,12 @@ gradients and will never be updated.
        the entire training run).
 
   Per training step:
-    1. Sample a mini-batch of (frame, mask, bbox, category_label) from ESCA
-       where the target category is present.
-    2. Paste the current patch (derived from tanh(w)) at the center of each
-       instance's bounding box (subject bbox for relation attack).
+    1. Sample a diverse mini-batch of (frame, mask, bbox, category_label) from
+       ESCA using diversity-aware EoT sampling, where the target category is
+       present.
+    2. Paste the current patch (derived from tanh(w)) at the SAM-selected anchor
+       with a small random offset (±10% of patch size) for each instance.
+       (Subject bbox anchor for relation attack, target bbox anchor for others.)
     3. Run differentiable PyTorch preprocessing (extract_single_object for
        category/attribute; extract_object_subject for relation).
     4. Forward pass through VineModel (PredicateModel) on each modified frame.
@@ -232,7 +278,7 @@ All three terms are described below.
 
 5.2 L_chameleon (visual camouflage)
 
-  Two components:
+  Three components:
 
   (a) Gram matrix style loss:
       Extract VGG16 [8] feature maps of the patch at layers relu1_2, relu2_2,
@@ -242,7 +288,19 @@ All three terms are described below.
   (b) Total variation (smoothness):
       L_tv = sum of squared differences between adjacent pixels in the patch
 
-  L_chameleon = L_style  +  λ_tv × L_tv     (λ_tv default: 1e-4)
+  (c) DINOv2 scene consistency [11]:
+      Extract DINOv2 CLS token of the full frame → scene context vector f_scene.
+      Extract DINOv2 CLS token of the patch region → patch context vector f_patch.
+      L_dino = ||f_patch  −  f_scene||²_2
+
+      This term pushes the patch's high-level visual semantics to match the
+      surrounding scene. Over training on diverse frames (different scene types),
+      the patch converges toward semantic neutrality — it does not appear alien
+      in any particular scene context. This is a stronger universality constraint
+      than the fixed reference Gram, because the chameleon target is dynamic per
+      frame rather than frozen from N=500 precomputed instances.
+
+  L_chameleon = L_style  +  λ_tv × L_tv  +  λ_dino × L_dino
 
   [CHANGE FROM INITIAL IDEA]
   The user initially proposed LAB color space distance as the chameleon
@@ -256,6 +314,13 @@ All three terms are described below.
   weave, hair texture, etc.). For a universal patch that must visually blend with
   many different instances of a category (all "person" objects across many clips),
   this generalization of appearance is essential.
+
+  DINOv2 scene consistency adds a semantic-level constraint on top of the
+  texture-level Gram loss: the patch must not only have the right texture but
+  also be semantically consistent with the scene as a whole. Together, Gram
+  (low-level texture coherence) + DINO (high-level scene semantics) provide
+  complementary coverage of the appearance space — improving both visual quality
+  and cross-scene generalization of the universal patch.
 
   Since the patch is universal (not instance-specific), the reference Gram is the
   average across many instances of the target category, precomputed once. This
@@ -395,22 +460,30 @@ NSAP/
 --------------------------------------------------------------------------------
 
 Patch:
-  coverage_ratio      0.3          (fraction of subject bbox; tunable)
-  patch_init          random       (uniform noise in tanh space)
+  coverage_ratio           0.3     (fraction of subject bbox; tunable)
+  patch_init               random  (uniform noise in tanh space)
+  patch_offset_range       0.1     (EoT stochastic offset, fraction of patch size)
+
+SAM anchor selection:
+  sam_anchor_warmup_steps  20      (gradient steps used to rank each candidate)
+  sam_anchor_n_instances   100     (instances used to score anchor candidates)
 
 Training:
-  optimizer           Adam
-  learning_rate       0.01
-  batch_size          8            (instances per EoT step)
-  num_steps           2000
-  reference_gram_n    500          (instances used to compute reference Gram)
-  vgg_layers          relu1_2, relu2_2, relu3_3
+  optimizer                Adam
+  learning_rate            0.01
+  batch_size               8       (instances per EoT step)
+  num_steps                2000
+  reference_gram_n         500     (instances used to compute reference Gram)
+  vgg_layers               relu1_2, relu2_2, relu3_3
+  dino_model               DINOv2-base (ViT-B/14)
+  dino_cluster_k           20      (scene context clusters for EoT sampling)
 
 Loss weights:
-  λ_c  (chameleon)    1.0
-  λ_p  (preservation) 0.5
-  λ_tv (smoothness)   1e-4
-  κ    (CW margin)    0.0
+  λ_c    (chameleon)       1.0
+  λ_p    (preservation)    0.5
+  λ_tv   (smoothness)      1e-4
+  λ_dino (scene semantics) 0.5
+  κ      (CW margin)       0.0
 
 Evaluation:
   target_fps          1
@@ -475,6 +548,29 @@ Initial proposal → Final decision → Reason
    extract object crops for the reference Gram computation without re-running
    GroundingDINO + SAM2.
 
+9. Fixed center placement → SAM-guided anchor selection
+   Placing the patch at the geometric center of the bounding box is a heuristic
+   that ignores where CLIP actually attends. SAM [12] segments the object into
+   semantic sub-regions; a short warm-up search identifies which sub-region
+   maximally disrupts the CLIP similarity score. This gives better attack
+   performance and provides an interpretable finding about model vulnerability.
+   A small stochastic offset (±10% of patch size) is added during EoT to make
+   the patch robust to slight misalignment across frames.
+
+10. Random EoT instance sampling → Diversity-aware EoT sampling (DINO-guided)
+    Uniform random sampling of EoT instances can over-represent dominant scene
+    types in the dataset. Clustering training instances by DINOv2 CLS features
+    and sampling across clusters ensures the patch is trained on the full
+    distribution of scene contexts, improving universality.
+
+11. VGG16 Gram reference only → VGG16 Gram + DINOv2 scene consistency
+    The Gram loss targets low-level texture coherence (fixed reference from 500
+    instances). DINOv2 scene consistency [11] adds a dynamic, per-frame semantic
+    target: the patch's CLS features should match the full frame's CLS features.
+    Together they cover both texture-level and semantic-level appearance
+    consistency, making the universal patch more convincingly camouflaged across
+    diverse scene contexts.
+
 
 --------------------------------------------------------------------------------
 10. REFERENCES
@@ -525,6 +621,19 @@ Initial proposal → Final decision → Reason
      S.-N. Lim, Z. Li, and M. Naik,
      "ESCA: Contextualizing Embodied Agents via Scene-Graph Generation,"
      Neural Information Processing Systems (NeurIPS), 2025. [Spotlight]
+
+[11] M. Oquab, T. Darcet, T. Moutakanni, H. Q. Vo, M. Szafraniec, V. Khalidov,
+     P. Fernandez, D. Haziza, F. Massa, A. El-Nouby, R. Howes, P.-Y. Huang,
+     H. Xu, V. Sharma, S.-W. Li, W. Galuba, M. Rabbat, M. Assran, N. Ballas,
+     G. Synnaeve, I. Misra, H. Jegou, J. Mairal, P. Labatut, A. Joulin, and
+     P. Bojanowski,
+     "DINOv2: Learning Robust Visual Features without Supervision,"
+     Transactions on Machine Learning Research (TMLR), 2024.
+
+[12] N. Ravi, V. Gabeur, Y.-T. Hu, R. Hu, C. Ryali, T. Ma, H. Komatsu,
+     E. Alexander, A. Berg, W. Wenzel, R. Girshick, and P. Dollár,
+     "SAM 2: Segment Anything in Images and Videos,"
+     arXiv:2408.00714, 2024.
 
 
 ================================================================================
