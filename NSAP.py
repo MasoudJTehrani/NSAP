@@ -11,6 +11,7 @@ ESCA_FILES = [
     ".videos_downloaded",
     ".frames_extracted",
     ".model_downloaded",
+    ".sam2_downloaded",
 ]
 
 
@@ -19,6 +20,7 @@ def download_prerequisites():
     from functions.download_videos import main as download_videos
     from functions.extract_frames import main as extract_frames
     from functions.download_model import main as download_model
+    from functions.download_model import download_sam2
 
     print("=== Step 1: Downloading dataset (annotations + masks) ===")
     download_dataset()
@@ -31,6 +33,9 @@ def download_prerequisites():
 
     print("\n=== Step 4: Downloading model ===")
     download_model()
+
+    print("\n=== Step 5: Downloading SAM2 checkpoint ===")
+    download_sam2()
 
 
 if not all((DATASET_DIR / f).exists() for f in ESCA_FILES):

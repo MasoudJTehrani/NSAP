@@ -8,6 +8,9 @@ model/
 # Cloned external repos (LASER, etc.)
 src/
 
+# output
+output/
+
 # Checkpoints (GroundingDINO, SAM2)
 checkpoints/
 

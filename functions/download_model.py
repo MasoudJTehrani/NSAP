@@ -116,6 +116,19 @@ def _download_file(url: str, dest: Path) -> None:
     print(f"  Saved: {dest.name}")
 
 
+SAM2_CHECKPOINT = ROOT / "checkpoints" / "sam2.1_hiera_tiny.pt"
+SAM2_CONFIG     = "configs/sam2.1/sam2.1_hiera_t.yaml"
+SAM2_SENTINEL   = DATASET_DIR / ".sam2_downloaded"
+
+
+def download_sam2() -> None:
+    if SAM2_SENTINEL.exists():
+        print("  SAM2 checkpoint already present — skipping.")
+        return
+    _download_file(HF_SAM2_URL, SAM2_CHECKPOINT)
+    SAM2_SENTINEL.touch()
+
+
 def main(include_detection: bool = False) -> None:
     hf = _require_hf_hub()
     if HF_TOKEN:
@@ -134,10 +147,8 @@ def main(include_detection: bool = False) -> None:
         _install_editable(name)
 
     if include_detection:
-        print("\n=== Detection checkpoints (GroundingDINO + SAM2) ===")
-        checkpoints = ROOT / "checkpoints"
-        _download_file(HF_GDINO_URL, checkpoints / "groundingdino_swint_ogc.pth")
-        _download_file(HF_SAM2_URL, checkpoints / "sam2.1_hiera_tiny.pt")
+        print("\n=== Detection checkpoints (GroundingDINO) ===")
+        _download_file(HF_GDINO_URL, ROOT / "checkpoints" / "groundingdino_swint_ogc.pth")
 
     MODEL_SENTINEL.touch()
     print(f"\nDone. Model in: {MODEL_DIR}")
