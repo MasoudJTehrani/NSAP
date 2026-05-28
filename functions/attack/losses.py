@@ -78,6 +78,14 @@ def l_chameleon_gram(
     x = patch_pixels.unsqueeze(0) / 255.0              # [1, 3, H, W] in [0, 1]
     x = (x - vgg_mean) / vgg_std
 
+    # VGG16 has 2 MaxPool layers before relu3_3 — input must be at least 32×32
+    if x.shape[2] < 32 or x.shape[3] < 32:
+        x = F.interpolate(
+            x,
+            size=(max(32, x.shape[2]), max(32, x.shape[3])),
+            mode='bilinear', align_corners=False,
+        )
+
     feats = _vgg_features(vgg, x)                      # list of [1, C, H, W]
 
     loss = torch.tensor(0.0, device=patch_pixels.device)

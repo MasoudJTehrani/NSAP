@@ -30,10 +30,12 @@ sys.path.insert(0, os.path.dirname(__file__))
 import torch
 
 
-def _attack_subdir(base_dir: str, mode: str, target: str, relation: str = "") -> str:
+def _attack_subdir(base_dir: str, mode: str, target: str, relation: str = "", attribute: str = "") -> str:
     """Return the per-attack output directory, e.g. output/patches/category_person/"""
     if mode == "relation" and relation:
         slug = f"relation_{relation.replace(' ', '_')}_{target.replace(' ', '_')}"
+    elif mode == "attribute" and attribute:
+        slug = f"attribute_{target.replace(' ', '_')}_{attribute.replace(' ', '_')}"
     else:
         slug = f"{mode}_{target.replace(' ', '_')}"
     return os.path.join(base_dir, slug)
@@ -61,7 +63,7 @@ def load_vine(device: str) -> "VineModel":
 def run_train(args):
     from functions.attack.train import train_patch, AttackConfig
 
-    attack_dir = _attack_subdir(args.output_dir, args.mode, args.target, args.relation)
+    attack_dir = _attack_subdir(args.output_dir, args.mode, args.target, args.relation, args.attribute)
 
     # Clear previous run for the same attack type + target
     if os.path.isdir(attack_dir):
@@ -70,16 +72,17 @@ def run_train(args):
     os.makedirs(attack_dir, exist_ok=True)
 
     config = AttackConfig(
-        attack_mode     = args.mode,
-        target_category = args.target,
-        target_relation = args.relation,
-        coverage_ratio  = args.coverage,
-        num_steps       = args.steps,
-        eot_batch_size  = args.batch,
-        learning_rate   = args.lr,
-        output_dir      = attack_dir,
-        ref_gram_cache  = os.path.join(args.output_dir, "gram_cache"),
-        clip_image_size = args.clip_size,
+        attack_mode      = args.mode,
+        target_category  = args.target,
+        target_relation  = args.relation,
+        target_attribute = args.attribute,
+        coverage_ratio   = args.coverage,
+        num_steps        = args.steps,
+        eot_batch_size   = args.batch,
+        learning_rate    = args.lr,
+        output_dir       = attack_dir,
+        ref_gram_cache   = os.path.join(args.output_dir, "gram_cache"),
+        clip_image_size  = args.clip_size,
     )
 
     device     = args.device
@@ -128,47 +131,56 @@ def run_eval(args):
         dataset_dir      = os.path.join(os.path.dirname(__file__), "dataset"),
         dataset_filename = "gpt_specs2_id_LLaVA_all.jsonl",
         target_category  = config.target_category,
-        data_percentage  = 10.0,
+        target_attribute = config.target_attribute if config.attack_mode == 'attribute' else None,
+        split            = 'test',
     )
 
-    # Hold-out: skip first 80% (those were training), evaluate on last 20%
-    n = len(dataset)
-    test_indices = list(range(int(0.8 * n), n))
-    test_items   = [dataset[i] for i in test_indices]
+    test_items = [dataset[i] for i in range(len(dataset))]
 
-    print(f"\n=== Flip Rate Evaluation ({len(test_items)} clips) ===")
+    print(f"\n=== Flip Rate (target objects only, {len(test_items)} clips) ===")
     flip_results = compute_flip_rate_across_clips(
         vine_model, test_items, patch, anchor, config, torch.device(device)
     )
-    print(f"Flip rate: {flip_results['flip_rate']:.3f}  "
-          f"({flip_results['n_flipped']}/{flip_results['n_total']} pairs flipped)")
+    print(f"Flip rate : {flip_results['flip_rate']:.1%}  "
+          f"({flip_results['n_flipped']}/{flip_results['n_total']} target objects flipped)")
 
-    print(f"\n=== Scene Graph Edit Distance & Isolation ===")
+    print(f"\n=== Scene Graph Edit Distance (target objects only) ===")
     iso_results = evaluate_isolation(
         vine_model, test_items, patch, anchor, config, torch.device(device)
     )
-    print(f"Mean edit distance : {iso_results['mean_edit_distance']:.2f}")
-    print(f"Mean isolation     : {iso_results['mean_isolation_score']:.2f}")
-    print(f"  category_sub     : {iso_results['mean_category_sub']:.2f}")
-    print(f"  attribute_sub    : {iso_results['mean_attribute_sub']:.2f}")
-    print(f"  relation_sub     : {iso_results['mean_relation_sub']:.2f}")
+    mode   = config.attack_mode
+    target = config.target_category or config.target_relation
+
+    attacked_label   = {'category': 'category', 'attribute': 'attribute', 'relation': 'relation'}[mode]
+    collateral_heads = [h for h in ('category', 'attribute', 'relation') if h != attacked_label]
+
+    print(f"Mean target objects per clip : {iso_results['mean_n_target_objects']:.1f}")
+    print(f"[attacked]  {attacked_label}_change_rate  : "
+          f"{iso_results[f'mean_{attacked_label}_change_rate']:.1%}  ← higher = stronger attack")
+    for h in collateral_heads:
+        print(f"[collateral] {h}_change_rate : "
+              f"{iso_results[f'mean_{h}_change_rate']:.1%}  ← lower = better isolation")
+    print(f"Disappear rate               : {iso_results['mean_disappear_rate']:.1%}")
+    print(f"Isolation score              : {iso_results['mean_isolation_score']:.1%}  "
+          f"(fraction of changes on attacked head — higher = better)")
 
     # Save results as JSON in the same directory as the patch file
     results = {
         "patch":        args.patch,
         "attack_mode":  config.attack_mode,
-        "target":       config.target_category,
+        "target":       target,
         "n_test_clips": len(test_items),
+        # Flip rate
         "flip_rate":    flip_results['flip_rate'],
         "n_flipped":    flip_results['n_flipped'],
         "n_total":      flip_results['n_total'],
-        "mean_edit_distance":   iso_results['mean_edit_distance'],
-        "mean_isolation_score": iso_results['mean_isolation_score'],
-        "mean_category_sub":    iso_results['mean_category_sub'],
-        "mean_attribute_sub":   iso_results['mean_attribute_sub'],
-        "mean_relation_sub":    iso_results['mean_relation_sub'],
-        "mean_node_ins":        iso_results.get('mean_node_ins', 0.0),
-        "mean_node_del":        iso_results.get('mean_node_del', 0.0),
+        # Edit distance rates (all normalised by n_target_objects per clip)
+        "mean_n_target_objects":      iso_results['mean_n_target_objects'],
+        "mean_category_change_rate":  iso_results['mean_category_change_rate'],
+        "mean_attribute_change_rate": iso_results['mean_attribute_change_rate'],
+        "mean_relation_change_rate":  iso_results['mean_relation_change_rate'],
+        "mean_disappear_rate":        iso_results['mean_disappear_rate'],
+        "mean_isolation_score":       iso_results['mean_isolation_score'],
     }
 
     patch_dir  = os.path.dirname(os.path.abspath(args.patch))
@@ -188,8 +200,10 @@ def main():
                         help="Attack mode")
     parser.add_argument("--target", default="person",
                         help="Target category string (e.g. 'person', 'girl', 'cup')")
-    parser.add_argument("--relation", default="next to",
+    parser.add_argument("--relation",  default="next to",
                         help="Target relation string for --mode relation")
+    parser.add_argument("--attribute", default="",
+                        help="Target attribute string for --mode attribute (e.g. 'standing')")
 
     # Training
     parser.add_argument("--steps",    type=int,   default=2000,  help="Training steps")

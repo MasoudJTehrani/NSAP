@@ -75,6 +75,7 @@ def _evaluate_anchor(
     warmup_steps: int,
     device: torch.device,
     clip_image_size: int,
+    target_attribute: str = '',
 ) -> float:
     """
     Evaluate one anchor candidate by running warmup_steps gradient steps on a random
@@ -104,12 +105,18 @@ def _evaluate_anchor(
     patch = AdversarialPatch(patch_h, patch_w, device)
     optimizer = optim.Adam(patch.parameters(), lr=0.01)
 
-    # Get correct-label index
-    consts = eval_instances[0]['gpt_spec'].get('consts', [])
-    correct_idx = next(
-        (i for i, c in enumerate(consts) if target_category.lower() in c.lower()),
-        0,
-    )
+    # Choose keywords and correct_idx based on attack mode
+    spec = eval_instances[0]['gpt_spec']
+    if attack_mode == 'attribute':
+        keywords = spec.get('unary_kws', [])
+        correct_idx = next(
+            (i for i, c in enumerate(keywords) if target_attribute.lower() in c.lower()), 0
+        )
+    else:
+        keywords = spec.get('consts', [])
+        correct_idx = next(
+            (i for i, c in enumerate(keywords) if target_category.lower() in c.lower()), 0
+        )
 
     for _ in range(warmup_steps):
         total = torch.tensor(0.0, device=device)
@@ -132,11 +139,10 @@ def _evaluate_anchor(
             pv   = clip_preprocess_torch(crop, clip_image_size).to(device)
             feat = clip_image_features(clip_encoder, pv)
 
-            # Scores against all consts using clip_sim
             text_tokens = vine_model.clip_tokenizer(
-                consts, return_tensors='pt', padding=True, truncation=True, max_length=75
+                keywords, return_tensors='pt', padding=True, truncation=True, max_length=75
             ).to(device)
-            text_feat = clip_text_features(vine_model.clip_cate_model, **text_tokens)
+            text_feat = clip_text_features(clip_encoder, **text_tokens)
 
             img_feat_n  = feat / feat.norm(p=2, dim=-1, keepdim=True)
             text_feat_n = text_feat / text_feat.norm(p=2, dim=-1, keepdim=True)
@@ -161,6 +167,7 @@ def select_anchor(
     device: torch.device = None,
     sam_predictor=None,
     clip_image_size: int = 224,
+    target_attribute: str = '',
 ) -> Anchor:
     """
     Select the best anchor position for the universal adversarial patch via SAM-guided
@@ -232,6 +239,7 @@ def select_anchor(
             warmup_steps=warmup_steps,
             device=device,
             clip_image_size=clip_image_size,
+            target_attribute=target_attribute,
         )
         print(f"  candidate {idx} ({cx}, {cy}): warmup loss = {loss:.4f}")
         if loss < best_loss:

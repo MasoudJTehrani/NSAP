@@ -24,8 +24,9 @@ from dataclasses import dataclass, field
 @dataclass
 class AttackConfig:
     attack_mode: str            # 'category' | 'attribute' | 'relation'
-    target_category: str        # e.g. 'person'   (category / attribute attacks)
+    target_category: str        # e.g. 'person'
     target_relation: str = ''   # e.g. 'next to'  (relation attack)
+    target_attribute: str = ''  # e.g. 'standing' (attribute attack — which attribute to flip)
 
     # Patch
     coverage_ratio: float = 0.3
@@ -258,6 +259,8 @@ def train_patch(
         dataset_dir=dataset_dir,
         dataset_filename=dataset_filename,
         target_category=config.target_category if config.attack_mode != 'relation' else None,
+        target_attribute=config.target_attribute if config.attack_mode == 'attribute' else None,
+        split='train',
     )
 
     if config.attack_mode == 'relation':
@@ -265,7 +268,10 @@ def train_patch(
             target_relation=config.target_relation,
         )
     else:
-        instances = dataset.build_instance_list(target_category=config.target_category)
+        instances = dataset.build_instance_list(
+            target_category=config.target_category,
+            target_predicate=config.target_attribute if config.attack_mode == 'attribute' else None,
+        )
 
     if len(instances) == 0:
         raise RuntimeError(f"No instances found for '{config.target_category}'.")
@@ -295,6 +301,7 @@ def train_patch(
             device=device,
             sam_predictor=sam_predictor,
             clip_image_size=config.clip_image_size,
+            target_attribute=config.target_attribute,
         )
 
     # ── Phase 0b: DINO diversity clustering ──────────────────────────────────
@@ -353,7 +360,9 @@ def train_patch(
             (i for i, c in enumerate(cat_kws) if config.target_category.lower() in c.lower()), 0
         )
     elif config.attack_mode == 'attribute':
-        correct_idx = 0   # updated per-instance from gpt_spec if available
+        correct_idx = next(
+            (i for i, c in enumerate(unary_kws) if config.target_attribute.lower() in c.lower()), 0
+        )
     else:
         correct_idx = next(
             (i for i, k in enumerate(binary_kws) if config.target_relation.lower() in k.lower()), 0

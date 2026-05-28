@@ -3,11 +3,67 @@ import json
 import pickle
 import math
 import torch
+from fractions import Fraction
 from torch.utils.data import Dataset
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional, Tuple, Set
 import numpy as np
 
 from laser.loading import load_video
+
+
+def _parse_frac_range(s: str) -> Tuple[float, float]:
+    """Parse '[0, 1/4]' or '[1/4,3/8]' → (0.0, 0.25)."""
+    s = s.strip().strip('[]')
+    parts = s.split(',', 1)
+    return float(Fraction(parts[0].strip())), float(Fraction(parts[1].strip()))
+
+
+def _relevant_frame_ids(gpt_spec: dict, n_frames: int, target_predicate: str) -> Set[int]:
+    """
+    Return the set of frame indices (into the loaded frame list) where
+    target_predicate is temporally active, using windowed_prog +
+    'video location precise'.
+
+    Each windowed_prog entry is [[start_slot, end_slot], program_string].
+    Slots start_slot..end_slot-1 index into 'video location precise', which
+    gives the fractional video position for each slot.
+
+    Falls back to all frames when temporal data is absent or the predicate
+    does not appear in any window.
+    """
+    windowed_prog = gpt_spec.get('windowed_prog', [])
+    video_loc     = gpt_spec.get('video location precise', [])
+
+    if not windowed_prog or not video_loc or n_frames == 0:
+        return set(range(n_frames))
+
+    pred_lower = target_predicate.lower()
+    fracs: List[Tuple[float, float]] = []
+
+    for window in windowed_prog:
+        slot_range, prog_str = window[0], window[1]
+        start_slot, end_slot = slot_range[0], slot_range[1]
+
+        if pred_lower not in prog_str.lower():
+            continue
+
+        for slot_idx in range(start_slot, min(end_slot, len(video_loc))):
+            try:
+                fracs.append(_parse_frac_range(video_loc[slot_idx]))
+            except Exception:
+                pass
+
+    if not fracs:
+        return set(range(n_frames))
+
+    frame_ids: Set[int] = set()
+    for start_f, end_f in fracs:
+        lo = max(0, int(start_f * n_frames))
+        hi = min(n_frames, math.ceil(end_f * n_frames))
+        if hi > lo:
+            frame_ids.update(range(lo, hi))
+
+    return frame_ids if frame_ids else set(range(n_frames))
 
 
 def _mask_pkl_to_tensors(raw_masks: dict) -> Dict[int, Dict[int, torch.Tensor]]:
@@ -59,21 +115,29 @@ class EscaAttackDataset(Dataset):
     Each item contains all frames and objects for one video clip.
     Use build_instance_list() to get a flat list filtered by target category.
 
+    The dataset is split deterministically into 80% train / 20% test by position
+    in the filtered record list. Pass split='train' or split='test' to get the
+    appropriate partition. Pass split=None (default) to get all records.
+
     Args:
         dataset_dir:       root directory of the ESCA dataset
         dataset_filename:  JSON annotation file (e.g. 'gpt_specs2_id_LLaVA_all.jsonl')
-        target_category:   if given, only videos containing this string in their consts are loaded
-        data_percentage:   fraction of dataset to load (0–100)
+        target_category:   if given, only videos containing this string are loaded
+        split:             'train' (first 80%), 'test' (last 20%), or None (all)
         target_fps:        FPS to sample from videos (default 1, matching VINE's eval)
         max_vid_len:       maximum frames per clip (default 10)
+        attack_mode:       'category', 'attribute', or 'relation'
     """
+
+    TRAIN_RATIO = 0.8
 
     def __init__(
         self,
         dataset_dir: str,
         dataset_filename: str,
         target_category: Optional[str] = None,
-        data_percentage: float = 100.0,
+        target_attribute: Optional[str] = None,
+        split: Optional[str] = None,
         target_fps: int = 1,
         max_vid_len: int = 10,
     ):
@@ -103,20 +167,23 @@ class EscaAttackDataset(Dataset):
         ann_path = os.path.join(dataset_dir, dataset_filename)
         with open(ann_path) as f:
             raw = [json.loads(line) for line in f if line.strip()]
-        max_count = math.floor(data_percentage / 100.0 * len(raw))
 
-        records = []
+        # Collect all matching records (no percentage cap — split handles partitioning)
+        all_records = []
         for datapoint in raw:
-            if len(records) >= max_count:
-                break
-
             video_id = datapoint['video_id']
             gpt_spec = datapoint
 
-            # Category filter
+            # target_category always filters against consts (object names)
             if target_category is not None:
                 consts = gpt_spec.get('consts', [])
                 if not any(target_category.lower() in c.lower() for c in consts):
+                    continue
+
+            # target_attribute additionally filters against unary_kws (attribute mode)
+            if target_attribute is not None:
+                unary_kws = gpt_spec.get('unary_kws', [])
+                if not any(target_attribute.lower() in u.lower() for u in unary_kws):
                     continue
 
             # Video and mask files use ytb_ or v_ prefix
@@ -129,14 +196,25 @@ class EscaAttackDataset(Dataset):
             if file_stem is None:
                 continue
 
-            records.append({
+            all_records.append({
                 'data_id':    video_id,
                 'video_path': video_lookup[file_stem],
                 'mask_path':  mask_lookup[file_stem],
                 'gpt_spec':   gpt_spec,
             })
 
-        self.records = records
+        # Deterministic 80/20 train/test split by position in the filtered list
+        n_train = math.floor(self.TRAIN_RATIO * len(all_records))
+        if split == 'train':
+            self.records = all_records[:n_train]
+        elif split == 'test':
+            self.records = all_records[n_train:]
+        else:
+            self.records = all_records
+
+        if split is not None:
+            print(f"  Split '{split}': {len(self.records)} / {len(all_records)} clips "
+                  f"({'80' if split == 'train' else '20'}% hold-out)")
 
     def __len__(self) -> int:
         return len(self.records)
@@ -184,10 +262,18 @@ class EscaAttackDataset(Dataset):
             'gpt_spec': rec['gpt_spec'],
         }
 
-    def build_instance_list(self, target_category: str) -> List[dict]:
+    def build_instance_list(
+        self,
+        target_category: str,
+        target_predicate: Optional[str] = None,
+    ) -> List[dict]:
         """
-        Returns a flat list of per-object instances where the object's predicted category
-        matches target_category (matched against gpt_spec['consts']).
+        Returns a flat list of per-object instances from clips already filtered
+        by __init__. target_category is confirmed against consts as a secondary check.
+
+        If target_predicate is given (used for attribute attacks), only frames
+        where that predicate is temporally active are included, using windowed_prog
+        and 'video location precise' from the clip's gpt_spec.
 
         Each entry in the list:
             data_id    : str
@@ -208,7 +294,15 @@ class EscaAttackDataset(Dataset):
             if not any(target_category.lower() in c.lower() for c in consts):
                 continue
 
+            n_frames = len(item['frames'])
+            relevant = (
+                _relevant_frame_ids(item['gpt_spec'], n_frames, target_predicate)
+                if target_predicate else set(range(n_frames))
+            )
+
             for frame_id, frame in enumerate(item['frames']):
+                if frame_id not in relevant:
+                    continue
                 frame_masks  = item['masks'].get(frame_id, {})
                 frame_bboxes = item['bboxes'].get(frame_id, {})
                 for obj_id, mask in frame_masks.items():
@@ -233,6 +327,9 @@ class EscaAttackDataset(Dataset):
         """
         Returns a flat list of per-pair instances for relation attack.
 
+        Only frames where target_relation is temporally active are included,
+        using windowed_prog and 'video location precise'.
+
         Each entry:
             data_id          : str
             frame_id         : int
@@ -255,7 +352,12 @@ class EscaAttackDataset(Dataset):
             if not any(target_relation.lower() in p[0].lower() for p in bin_preds):
                 continue
 
+            n_frames = len(item['frames'])
+            relevant = _relevant_frame_ids(item['gpt_spec'], n_frames, target_relation)
+
             for frame_id, frame in enumerate(item['frames']):
+                if frame_id not in relevant:
+                    continue
                 frame_masks  = item['masks'].get(frame_id, {})
                 frame_bboxes = item['bboxes'].get(frame_id, {})
 

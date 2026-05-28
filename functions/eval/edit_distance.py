@@ -1,14 +1,12 @@
 """
 Scene graph edit distance — proves attack isolation.
 
-Computes the structural difference between a clean and attacked scene graph.
-Breakdowns:
-  - node label substitution (category changed)
-  - node attribute substitution (attribute changed)
-  - edge label substitution (relation changed)
-  - node insertion / deletion (object appeared or disappeared)
+All metrics are computed on the TARGET object(s) only:
+  - category/attribute attack: objects whose clean-SG category matches target_category
+  - relation attack: (subj, obj) pairs whose clean-SG relation matches target_relation
 
-An isolation score is derived: fraction of total edits attributable to the attacked head.
+Per-object rates are normalised by n_target_objects so they are comparable
+across clips regardless of how many objects the clip contains.
 """
 
 from typing import Dict, Tuple
@@ -18,107 +16,155 @@ from functions.eval.scene_graph import SceneGraph
 
 @dataclass
 class EditDistanceResult:
-    # Raw operation counts
-    category_substitutions: int = 0    # object changed class
-    attribute_substitutions: int = 0   # object changed attribute
-    relation_substitutions: int = 0    # relation label changed
-    node_insertions: int = 0           # new object appeared after patch
-    node_deletions: int = 0            # object disappeared after patch
+    # How many target objects were found in the clean scene graph
+    n_target_objects: int = 0
+    # How many target relations were found (relation mode only)
+    n_target_relations: int = 0
+
+    # Raw change counts on target objects
+    category_changes: int = 0    # target objects whose category label changed
+    attribute_changes: int = 0   # target objects whose attribute label changed
+    relation_changes: int = 0    # target relations that changed (relation mode)
+    target_disappeared: int = 0  # target objects absent from attacked SG
+
+    # ── rates (normalised by n_target_objects / n_target_relations) ──────────
 
     @property
-    def total(self) -> int:
+    def _obj_denom(self) -> int:
+        return max(self.n_target_objects, 1)
+
+    @property
+    def _rel_denom(self) -> int:
+        return max(self.n_target_relations, 1)
+
+    @property
+    def category_change_rate(self) -> float:
+        return self.category_changes / self._obj_denom
+
+    @property
+    def attribute_change_rate(self) -> float:
+        return self.attribute_changes / self._obj_denom
+
+    @property
+    def relation_change_rate(self) -> float:
+        return self.relation_changes / self._rel_denom
+
+    @property
+    def disappear_rate(self) -> float:
+        return self.target_disappeared / self._obj_denom
+
+    @property
+    def total_changes(self) -> int:
         return (
-            self.category_substitutions +
-            self.attribute_substitutions +
-            self.relation_substitutions +
-            self.node_insertions +
-            self.node_deletions
+            self.category_changes
+            + self.attribute_changes
+            + self.relation_changes
+            + self.target_disappeared
         )
 
     def isolation_score(self, attack_mode: str) -> float:
         """
-        Fraction of total edits that are on the attacked head.
-        Value of 1.0 = perfectly isolated; 0.0 = attack spilled everywhere.
+        Fraction of changes on target objects that hit the attacked head.
+        1.0 = perfectly isolated; 0.0 = all changes were collateral.
+        Returns 1.0 when there are no changes (nothing to isolate).
         """
-        if self.total == 0:
-            return 1.0   # no edits at all — clean isolation
-
+        if self.total_changes == 0:
+            return 1.0
         if attack_mode == 'category':
-            attacked_edits = self.category_substitutions + self.node_insertions + self.node_deletions
-        elif attack_mode == 'attribute':
-            attacked_edits = self.attribute_substitutions
-        elif attack_mode == 'relation':
-            attacked_edits = self.relation_substitutions
-        else:
-            return 0.0
+            return (self.category_changes + self.target_disappeared) / self.total_changes
+        if attack_mode == 'attribute':
+            return self.attribute_changes / self.total_changes
+        if attack_mode == 'relation':
+            return self.relation_changes / self.total_changes
+        return 0.0
 
-        return attacked_edits / self.total
 
-    def summary(self, attack_mode: str) -> str:
-        return (
-            f"EditDistance(total={self.total} | "
-            f"cat_sub={self.category_substitutions} "
-            f"attr_sub={self.attribute_substitutions} "
-            f"rel_sub={self.relation_substitutions} "
-            f"ins={self.node_insertions} "
-            f"del={self.node_deletions} | "
-            f"isolation={self.isolation_score(attack_mode):.2f})"
-        )
+def _match(label: str, target: str) -> bool:
+    return target.lower() in label.lower()
 
 
 def compute_edit_distance(
     sg_clean: SceneGraph,
     sg_attacked: SceneGraph,
+    attack_mode: str = 'category',
+    target_category: str = '',
+    target_relation: str = '',
 ) -> EditDistanceResult:
     """
-    Compute the edit distance between two scene graphs.
-
-    Operations:
-      - Category substitution: same obj_id, different category label
-      - Attribute substitution: same obj_id, different attribute label
-      - Relation substitution: same (subj, obj) pair, different relation label
-      - Node insertion: obj_id present in sg_attacked but not sg_clean
-      - Node deletion: obj_id present in sg_clean but not sg_attacked
+    Compute edit distance restricted to the target object(s).
 
     Args:
-        sg_clean:    SceneGraph from the original un-patched frames
-        sg_attacked: SceneGraph from the patched frames
+        sg_clean:        SceneGraph from original un-patched frames
+        sg_attacked:     SceneGraph from patched frames
+        attack_mode:     'category', 'attribute', or 'relation'
+        target_category: category string being attacked (e.g. 'camera')
+        target_relation: relation string being attacked (e.g. 'wearing')
 
     Returns:
-        EditDistanceResult
+        EditDistanceResult with per-target-object rates
     """
     result = EditDistanceResult()
 
-    clean_obj_ids    = set(sg_clean.categories.keys())
-    attacked_obj_ids = set(sg_attacked.categories.keys())
+    # ── Identify target objects ───────────────────────────────────────────────
+    if attack_mode in ('category', 'attribute'):
+        target_obj_ids = {
+            obj_id for obj_id, cat in sg_clean.categories.items()
+            if _match(cat, target_category)
+        } if target_category else set(sg_clean.categories.keys())
 
-    # Node insertions and deletions
-    result.node_insertions = len(attacked_obj_ids - clean_obj_ids)
-    result.node_deletions  = len(clean_obj_ids - attacked_obj_ids)
+        result.n_target_objects = len(target_obj_ids)
 
-    # Category and attribute substitutions for objects present in both
-    shared_obj_ids = clean_obj_ids & attacked_obj_ids
-    for obj_id in shared_obj_ids:
-        clean_cat  = sg_clean.categories.get(obj_id)
-        attack_cat = sg_attacked.categories.get(obj_id)
-        if clean_cat is not None and attack_cat is not None and clean_cat != attack_cat:
-            result.category_substitutions += 1
+        attacked_obj_ids = set(sg_attacked.categories.keys())
+        result.target_disappeared = len(target_obj_ids - attacked_obj_ids)
 
-        clean_attr  = sg_clean.attributes.get(obj_id)
-        attack_attr = sg_attacked.attributes.get(obj_id)
-        if clean_attr is not None and attack_attr is not None and clean_attr != attack_attr:
-            result.attribute_substitutions += 1
+        for obj_id in target_obj_ids & attacked_obj_ids:
+            clean_cat    = sg_clean.categories.get(obj_id)
+            attacked_cat = sg_attacked.categories.get(obj_id)
+            if clean_cat and attacked_cat and clean_cat != attacked_cat:
+                result.category_changes += 1
 
-    # Relation substitutions for pairs present in both
-    clean_rel_pairs    = set(sg_clean.relations.keys())
-    attacked_rel_pairs = set(sg_attacked.relations.keys())
-    shared_pairs       = clean_rel_pairs & attacked_rel_pairs
+            clean_attr    = sg_clean.attributes.get(obj_id)
+            attacked_attr = sg_attacked.attributes.get(obj_id)
+            if clean_attr and attacked_attr and clean_attr != attacked_attr:
+                result.attribute_changes += 1
 
-    for pair in shared_pairs:
-        clean_rel  = sg_clean.relations[pair]
-        attack_rel = sg_attacked.relations[pair]
-        if clean_rel != attack_rel:
-            result.relation_substitutions += 1
+    elif attack_mode == 'relation':
+        target_pairs = {
+            pair for pair, rel in sg_clean.relations.items()
+            if _match(rel, target_relation)
+        } if target_relation else set(sg_clean.relations.keys())
+
+        # Optionally filter by subject category
+        if target_category:
+            target_pairs = {
+                pair for pair in target_pairs
+                if _match(sg_clean.categories.get(pair[0], ''), target_category)
+            }
+
+        result.n_target_relations = len(target_pairs)
+        # Use target subjects as the "target objects" for rate normalisation
+        target_obj_ids = {pair[0] for pair in target_pairs}
+        result.n_target_objects = len(target_obj_ids)
+
+        attacked_obj_ids = set(sg_attacked.categories.keys())
+        result.target_disappeared = len(target_obj_ids - attacked_obj_ids)
+
+        for pair in target_pairs:
+            clean_rel    = sg_clean.relations.get(pair)
+            attacked_rel = sg_attacked.relations.get(pair)
+            if clean_rel and attacked_rel and clean_rel != attacked_rel:
+                result.relation_changes += 1
+
+        for obj_id in target_obj_ids & attacked_obj_ids:
+            clean_cat    = sg_clean.categories.get(obj_id)
+            attacked_cat = sg_attacked.categories.get(obj_id)
+            if clean_cat and attacked_cat and clean_cat != attacked_cat:
+                result.category_changes += 1
+
+            clean_attr    = sg_clean.attributes.get(obj_id)
+            attacked_attr = sg_attacked.attributes.get(obj_id)
+            if clean_attr and attacked_attr and clean_attr != attacked_attr:
+                result.attribute_changes += 1
 
     return result
 
@@ -132,16 +178,16 @@ def evaluate_isolation(
     device,
 ) -> dict:
     """
-    Compute edit distance and isolation score over a list of test clips.
+    Compute target-object edit distance and isolation over test clips.
 
-    Returns:
-        dict with:
-            'mean_edit_distance':       float
-            'mean_isolation_score':     float
-            'mean_category_sub':        float
-            'mean_attribute_sub':       float
-            'mean_relation_sub':        float
-            'per_clip':                 list of EditDistanceResult
+    Returns dict with per-rate metrics (all normalised by n_target_objects):
+        mean_n_target_objects     float  — avg target objects per clip
+        mean_category_change_rate float  — fraction of target objs whose category changed
+        mean_attribute_change_rate float — fraction of target objs whose attribute changed
+        mean_relation_change_rate  float — fraction of target relations that changed
+        mean_disappear_rate        float — fraction of target objs that disappeared
+        mean_isolation_score       float — fraction of changes on the attacked head
+        per_clip                   list[EditDistanceResult]
     """
     from functions.attack.patch import paste_patch, compute_patch_size
     from functions.eval.scene_graph import predict_scene_graph
@@ -152,10 +198,10 @@ def evaluate_isolation(
         if item is None:
             continue
 
-        clean_frames   = item['frames']
-        masks          = item['masks']
-        bboxes         = item['bboxes']
-        gpt_spec       = item['gpt_spec']
+        clean_frames = item['frames']
+        masks        = item['masks']
+        bboxes       = item['bboxes']
+        gpt_spec     = item['gpt_spec']
 
         patched_frames = []
         for frame_id, frame in enumerate(clean_frames):
@@ -172,7 +218,12 @@ def evaluate_isolation(
         sg_clean    = predict_scene_graph(vine_model, clean_frames,   masks, bboxes, gpt_spec, device)
         sg_attacked = predict_scene_graph(vine_model, patched_frames, masks, bboxes, gpt_spec, device)
 
-        ed = compute_edit_distance(sg_clean, sg_attacked)
+        ed = compute_edit_distance(
+            sg_clean, sg_attacked,
+            attack_mode      = config.attack_mode,
+            target_category  = config.target_category,
+            target_relation  = config.target_relation,
+        )
         all_edits.append(ed)
 
     if not all_edits:
@@ -180,12 +231,11 @@ def evaluate_isolation(
 
     n = len(all_edits)
     return {
-        'mean_edit_distance':   sum(e.total for e in all_edits) / n,
-        'mean_isolation_score': sum(e.isolation_score(config.attack_mode) for e in all_edits) / n,
-        'mean_category_sub':    sum(e.category_substitutions for e in all_edits) / n,
-        'mean_attribute_sub':   sum(e.attribute_substitutions for e in all_edits) / n,
-        'mean_relation_sub':    sum(e.relation_substitutions for e in all_edits) / n,
-        'mean_node_ins':        sum(e.node_insertions for e in all_edits) / n,
-        'mean_node_del':        sum(e.node_deletions  for e in all_edits) / n,
-        'per_clip':             all_edits,
+        'mean_n_target_objects':      sum(e.n_target_objects       for e in all_edits) / n,
+        'mean_category_change_rate':  sum(e.category_change_rate   for e in all_edits) / n,
+        'mean_attribute_change_rate': sum(e.attribute_change_rate  for e in all_edits) / n,
+        'mean_relation_change_rate':  sum(e.relation_change_rate   for e in all_edits) / n,
+        'mean_disappear_rate':        sum(e.disappear_rate         for e in all_edits) / n,
+        'mean_isolation_score':       sum(e.isolation_score(config.attack_mode) for e in all_edits) / n,
+        'per_clip':                   all_edits,
     }
