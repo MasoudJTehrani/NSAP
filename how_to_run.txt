@@ -3,9 +3,6 @@ python run_attack.py --mode category --target person
 python run_attack.py --mode category --target cup
 python run_attack.py --mode category --target dog
 
-# Attribute attack
-python run_attack.py --mode attribute --target standing
-python run_attack.py --mode attribute --target walking
 
 # Relation attack
 python run_attack.py --mode relation --relation "holding" --target person
