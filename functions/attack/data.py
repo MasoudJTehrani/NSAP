@@ -168,53 +168,61 @@ class EscaAttackDataset(Dataset):
         with open(ann_path) as f:
             raw = [json.loads(line) for line in f if line.strip()]
 
-        # Collect all matching records (no percentage cap — split handles partitioning)
-        all_records = []
+        # One pass: collect all mask-covered matching clips (for stable split),
+        # and record which of them also have video on disk.
+        all_stems: List[str]          = []   # mask-only — used to compute split
+        seen_stems: Set[str]          = set()
+        record_map: Dict[str, dict]   = {}   # stem → record (only when video present)
+
         for datapoint in raw:
             video_id = datapoint['video_id']
             gpt_spec = datapoint
 
-            # target_category always filters against consts (object names)
             if target_category is not None:
                 consts = gpt_spec.get('consts', [])
                 if not any(target_category.lower() in c.lower() for c in consts):
                     continue
 
-            # target_attribute additionally filters against unary_kws (attribute mode)
             if target_attribute is not None:
                 unary_kws = gpt_spec.get('unary_kws', [])
                 if not any(target_attribute.lower() in u.lower() for u in unary_kws):
                     continue
 
-            # Video and mask files use ytb_ or v_ prefix
             file_stem = None
             for prefix in (f'ytb_{video_id}', f'v_{video_id}'):
-                if prefix in video_lookup and prefix in mask_lookup:
+                if prefix in mask_lookup:
                     file_stem = prefix
                     break
 
-            if file_stem is None:
+            if file_stem is None or file_stem in seen_stems:
                 continue
+            seen_stems.add(file_stem)
+            all_stems.append(file_stem)
 
-            all_records.append({
-                'data_id':    video_id,
-                'video_path': video_lookup[file_stem],
-                'mask_path':  mask_lookup[file_stem],
-                'gpt_spec':   gpt_spec,
-            })
+            if file_stem in video_lookup:
+                record_map[file_stem] = {
+                    'data_id':    video_id,
+                    'video_path': video_lookup[file_stem],
+                    'mask_path':  mask_lookup[file_stem],
+                    'gpt_spec':   gpt_spec,
+                }
 
-        # Deterministic 80/20 train/test split by position in the filtered list
-        n_train = math.floor(self.TRAIN_RATIO * len(all_records))
+        # Split computed on the full mask-covered set — stable regardless of
+        # which videos happen to be downloaded at any given time.
+        n_train = math.floor(self.TRAIN_RATIO * len(all_stems))
         if split == 'train':
-            self.records = all_records[:n_train]
+            selected_stems = all_stems[:n_train]
         elif split == 'test':
-            self.records = all_records[n_train:]
+            selected_stems = all_stems[n_train:]
         else:
-            self.records = all_records
+            selected_stems = all_stems
+
+        # Records = selected stems that also have a video on disk
+        self.records = [record_map[s] for s in selected_stems if s in record_map]
 
         if split is not None:
-            print(f"  Split '{split}': {len(self.records)} / {len(all_records)} clips "
-                  f"({'80' if split == 'train' else '20'}% hold-out)")
+            print(f"  Split '{split}': {len(self.records)} / {len(selected_stems)} clips "
+                  f"on disk ({len(all_stems)} mask-covered total)")
 
     def __len__(self) -> int:
         return len(self.records)
@@ -239,18 +247,34 @@ class EscaAttackDataset(Dataset):
         if len(raw_frames) == 0:
             return None
 
-        # Sub-sample to max_vid_len (same logic as LLaVADataset)
-        if len(raw_frames) > self.max_vid_len:
-            rate = math.ceil(len(raw_frames) / self.max_vid_len)
-            raw_frames = [f for i, f in enumerate(raw_frames) if i % rate == 0]
-
-        frames = [torch.from_numpy(f.astype(np.float32)) for f in raw_frames]
-
         try:
             raw_masks = pickle.load(open(rec['mask_path'], 'rb'))
         except Exception:
             return None
 
+        # Frames and masks must be frame-for-frame aligned: the mask pkl is keyed by
+        # the same frame index that load_video produces at this target_fps. A count
+        # mismatch means we cannot trust the alignment, so skip the clip rather than
+        # silently pairing a frame with the wrong object mask / bbox.
+        # (mirrors LLaVADataset.__getitem__ in src/LASER/laser/training/llava_dataset.py)
+        if len(raw_frames) != len(raw_masks):
+            return None
+
+        # Sub-sample frames AND masks together with the SAME rate, re-indexing the
+        # mask frame-ids (new_fid = fid // rate) so that masks[k] / bboxes[k] always
+        # correspond to frames[k]. Subsampling frames alone (the previous behaviour)
+        # left masks on their original indices, so the bbox for frame k was read from
+        # a different original frame and the patch landed off the moving target.
+        if len(raw_frames) > self.max_vid_len:
+            rate = math.ceil(len(raw_frames) / self.max_vid_len)
+            raw_frames = [f for i, f in enumerate(raw_frames) if i % rate == 0]
+            raw_masks = {
+                int(fid // rate): obj_masks
+                for fid, obj_masks in raw_masks.items()
+                if fid % rate == 0
+            }
+
+        frames = [torch.from_numpy(f.astype(np.float32)) for f in raw_frames]
         masks  = _mask_pkl_to_tensors(raw_masks)
         bboxes = _bboxes_from_masks(masks)
 
@@ -381,6 +405,75 @@ class EscaAttackDataset(Dataset):
                             'gpt_spec':    item['gpt_spec'],
                         })
         return instances
+
+
+def get_split_video_stems(
+    dataset_dir: str,
+    dataset_filename: str,
+    target_category: Optional[str] = None,
+    target_attribute: Optional[str] = None,
+    target_relation: Optional[str] = None,
+    split: Optional[str] = None,
+    train_ratio: float = 0.8,
+) -> List[str]:
+    """
+    Return video stems (e.g. 'ytb_XXXX') belonging to the given split,
+    computed from ALL mask-covered clips that match the target filters.
+    Stable regardless of which videos are currently downloaded.
+
+    Used by download_videos to limit downloads to the relevant split.
+    """
+    masks_root = os.path.join(dataset_dir, "mini_LLaVA_10000_masks")
+    mask_stems: Set[str] = set()
+    for root, _, files in os.walk(masks_root):
+        for fname in files:
+            if fname.endswith('_mask.pkl'):
+                mask_stems.add(fname[:-len('_mask.pkl')])
+
+    ann_path = os.path.join(dataset_dir, dataset_filename)
+    all_stems: List[str] = []
+    seen:      Set[str]  = set()
+
+    with open(ann_path) as f:
+        for line in f:
+            if not line.strip():
+                continue
+            dp = json.loads(line)
+            video_id = dp['video_id']
+            gpt_spec = dp
+
+            if target_category is not None:
+                consts = gpt_spec.get('consts', [])
+                if not any(target_category.lower() in c.lower() for c in consts):
+                    continue
+
+            if target_attribute is not None:
+                unary_kws = gpt_spec.get('unary_kws', [])
+                if not any(target_attribute.lower() in u.lower() for u in unary_kws):
+                    continue
+
+            if target_relation is not None:
+                binary_kws = gpt_spec.get('binary_kws', [])
+                if not any(target_relation.lower() in b.lower() for b in binary_kws):
+                    continue
+
+            file_stem = None
+            for prefix in (f'ytb_{video_id}', f'v_{video_id}'):
+                if prefix in mask_stems:
+                    file_stem = prefix
+                    break
+
+            if file_stem is None or file_stem in seen:
+                continue
+            seen.add(file_stem)
+            all_stems.append(file_stem)
+
+    n_train = math.floor(train_ratio * len(all_stems))
+    if split == 'train':
+        return all_stems[:n_train]
+    elif split == 'test':
+        return all_stems[n_train:]
+    return all_stems
 
 
 def _walk_paths(directory: str):

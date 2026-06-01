@@ -1,27 +1,50 @@
 """
-Download a subset of ESCA videos from YouTube using yt-dlp.
+Download ESCA videos from YouTube using yt-dlp.
 Only downloads videos that have masks AND a resolvable YouTube ID.
 
-Supported sources:
-  - liwei_youtube_videos (ytb_XXXXXXXXXXX)  →  8171 videos
-  - activitynet          (v_XXXXXXXXXXX)    →    92 videos
-  Skipped (not on YouTube): ego4d, Charades, NextQA, hash-named clips
+Primary entry points
+--------------------
+ensure_videos_for_targets(targets)
+    Download all clips that match the given attack targets (category /
+    attribute / relation).  Already-present clips are skipped.  Called
+    automatically by run_attack.py before each training/eval run.
+
+cleanup_all_videos()
+    Delete every video file in the videos directory.  Called automatically
+    after training/eval unless --keep-videos is passed.
+
+download_for_targets(targets, max_per_target)
+    Same as ensure_videos_for_targets but with an explicit per-target cap.
+
+main(max_videos)
+    Legacy bulk download (used by first-time setup only).
+
+Supported sources
+-----------------
+  liwei_youtube_videos  (ytb_XXXXXXXXXXX)  →  ~8171 videos
+  activitynet           (v_XXXXXXXXXXX)    →    ~92 videos
+  Skipped: ego4d, Charades, NextQA, hash-named clips (not on YouTube)
 """
 
 import sys
+import json
+import shutil
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent
+ROOT        = Path(__file__).resolve().parent.parent
 DATASET_DIR = ROOT / "dataset"
-MASKS_DIR = DATASET_DIR / "mini_LLaVA_10000_masks"
-VIDEOS_DIR = DATASET_DIR / "videos"
+MASKS_DIR   = DATASET_DIR / "mini_LLaVA_10000_masks"
+VIDEOS_DIR  = DATASET_DIR / "videos"
 VIDEOS_SENTINEL = DATASET_DIR / ".videos_downloaded"
 
 DEFAULT_MAX_VIDEOS = 500
 YOUTUBE_BASE = "https://www.youtube.com/watch?v="
+VIDEO_EXTS   = (".mp4", ".webm", ".mkv", ".avi", ".mov")
 
 _SKIP_SOURCES = {"ego4d", "Charades", "NextQA", "youcook2"}
 
+
+# ── helpers ───────────────────────────────────────────────────────────────────
 
 def _require_yt_dlp():
     try:
@@ -32,77 +55,79 @@ def _require_yt_dlp():
         sys.exit(1)
 
 
-def _get_downloadable_videos() -> list[tuple[str, str]]:
+def _get_downloadable_videos() -> dict:
     """
-    Returns [(video_id, youtube_id), ...] for all mask-covered videos
-    that have a resolvable YouTube ID.
-    video_id  — the original ID used to name the mask file and frames dir
-    youtube_id — the bare 11-char YouTube ID used for the download URL
+    Returns {video_id: youtube_id} for all mask-covered clips with a
+    resolvable YouTube ID.
     """
     if not MASKS_DIR.exists():
-        raise FileNotFoundError(f"Masks not extracted yet: {MASKS_DIR}")
+        raise FileNotFoundError(f"Masks not found: {MASKS_DIR}")
 
-    pairs = []
+    result = {}
     for pkl in MASKS_DIR.rglob("*_mask.pkl"):
         parts = set(pkl.parts)
-
         if parts & _SKIP_SOURCES:
             continue
-
         video_id = pkl.stem.removesuffix("_mask")
-
         if "activitynet" in parts and video_id.startswith("v_"):
-            pairs.append((video_id, video_id[2:]))          # v_XXXXXXXXXXX → XXXXXXXXXXX
+            result[video_id] = video_id[2:]
         elif video_id.startswith("ytb_"):
-            pairs.append((video_id, video_id[4:]))           # ytb_XXXXXXXXXXX → XXXXXXXXXXX
-        # hash-named clips: no YouTube ID derivable — skip
-
-    return sorted(pairs)
+            result[video_id] = video_id[4:]
+    return result
 
 
-def main(max_videos: int = DEFAULT_MAX_VIDEOS) -> None:
-    yt_dlp = _require_yt_dlp()
+def _already_downloaded(video_id: str) -> bool:
+    return any((VIDEOS_DIR / f"{video_id}{ext}").exists() for ext in VIDEO_EXTS)
 
-    print("Reading downloadable video IDs from mask subset...")
-    all_pairs = _get_downloadable_videos()
-    target_pairs = all_pairs[:max_videos]
-    print(f"  {len(all_pairs)} YouTube-downloadable masked videos — targeting {len(target_pairs)}.")
+
+def _datapoint_matches(datapoint: dict, targets: list) -> bool:
+    """
+    Return True if the datapoint satisfies ANY of the target dicts.
+    Each target dict may contain keys: 'category', 'attribute', 'relation'.
+    All specified keys must match (AND within a target, OR across targets).
+    """
+    consts      = [c.lower() for c in datapoint.get('consts',      [])]
+    unary_kws   = [u.lower() for u in datapoint.get('unary_kws',   [])]
+    binary_kws  = [b.lower() for b in datapoint.get('binary_kws',  [])]
+
+    for target in targets:
+        cat = target.get('category',  '').lower()
+        att = target.get('attribute', '').lower()
+        rel = target.get('relation',  '').lower()
+        if cat and not any(cat in c for c in consts):
+            continue
+        if att and not any(att in u for u in unary_kws):
+            continue
+        if rel and not any(rel in b for b in binary_kws):
+            continue
+        return True
+    return False
+
+
+def _run_downloads(yt_dlp_mod, pending: list) -> list:
+    """
+    Download a list of (video_id, yt_id) pairs.
+    Returns list of failed video_ids.
+    """
+    if not pending:
+        return []
 
     VIDEOS_DIR.mkdir(parents=True, exist_ok=True)
-
-    # Stale sentinel: sentinel exists but videos directory is empty
-    if VIDEOS_SENTINEL.exists() and not any(VIDEOS_DIR.iterdir()):
-        print("  Stale sentinel found (no videos present) — re-downloading.")
-        VIDEOS_SENTINEL.unlink()
-
-    VIDEO_EXTS = (".mp4", ".webm", ".mkv", ".avi", ".mov")
-    pending = [
-        (vid, yt) for vid, yt in target_pairs
-        if not any((VIDEOS_DIR / f"{vid}{ext}").exists() for ext in VIDEO_EXTS)
-    ]
-    print(f"  {len(target_pairs) - len(pending)} already downloaded, {len(pending)} to go.\n")
-
-    if not pending:
-        VIDEOS_SENTINEL.touch()
-        print(f"All done. Videos in: {VIDEOS_DIR}")
-        return
-
     failed = []
-    # Use %(id)s naming then rename to video_id so frames can be matched back to masks
+
     ydl_opts = {
-        "format": "best[height<=360]/worst",
-        "outtmpl": str(VIDEOS_DIR / "%(id)s.%(ext)s"),
-        "quiet": True,
-        "no_warnings": True,
+        "format":       "best[height<=360]/worst",
+        "outtmpl":      str(VIDEOS_DIR / "%(id)s.%(ext)s"),
+        "quiet":        True,
+        "no_warnings":  True,
         "ignoreerrors": True,
     }
 
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+    with yt_dlp_mod.YoutubeDL(ydl_opts) as ydl:
         for i, (video_id, yt_id) in enumerate(pending, 1):
             print(f"  [{i}/{len(pending)}] {video_id} ...", end=" ", flush=True)
             ydl.download([f"{YOUTUBE_BASE}{yt_id}"])
 
-            # Rename yt_id.ext → video_id.ext
             renamed = False
             for f in VIDEOS_DIR.glob(f"{yt_id}.*"):
                 f.rename(VIDEOS_DIR / f"{video_id}{f.suffix}")
@@ -112,14 +137,131 @@ def main(max_videos: int = DEFAULT_MAX_VIDEOS) -> None:
             if renamed:
                 print("ok")
             else:
-                print("FAILED")
+                print("FAILED (unavailable / private / geo-blocked)")
                 failed.append(video_id)
 
-    if failed:
-        print(f"\n  {len(failed)} videos failed (unavailable/private/geo-blocked).")
+    return failed
 
+
+# ── public API ────────────────────────────────────────────────────────────────
+
+def ensure_videos_for_targets(
+    targets: list,
+    annotation_file: str = None,
+    max_per_target: int = 9999,
+    split_stems: set = None,
+) -> int:
+    """
+    Ensure all clips matching the given attack targets are downloaded.
+    Already-present clips are skipped.  Returns the number of clips now
+    available on disk for those targets.
+
+    Args:
+        targets:         list of dicts, e.g.
+                           [{"category": "person", "attribute": "standing"}]
+        annotation_file: path to JSONL (defaults to gpt_specs2_id_LLaVA_all.jsonl)
+        max_per_target:  safety cap per individual target (default: no cap)
+        split_stems:     if given, only download clips whose stem is in this set
+                         (used to restrict downloads to train or test split only)
+
+    Returns:
+        number of matching video files now present on disk
+    """
+    yt_dlp = _require_yt_dlp()
+
+    if annotation_file is None:
+        annotation_file = str(DATASET_DIR / "gpt_specs2_id_LLaVA_all.jsonl")
+
+    all_downloadable = _get_downloadable_videos()
+
+    print("Scanning annotations for matching clips...")
+    matched = []
+    seen    = set()
+
+    with open(annotation_file) as f:
+        for line in f:
+            if not line.strip():
+                continue
+            dp  = json.loads(line)
+            vid = dp.get('video_id', '')
+            prefix = next(
+                (p for p in (f'ytb_{vid}', f'v_{vid}') if p in all_downloadable),
+                None,
+            )
+            if prefix is None or prefix in seen:
+                continue
+            if _datapoint_matches(dp, targets):
+                seen.add(prefix)
+                matched.append(prefix)
+
+    limit   = max_per_target * max(len(targets), 1)
+    matched = matched[:limit]
+
+    if split_stems is not None:
+        matched = [vid for vid in matched if vid in split_stems]
+
+    pending = [(vid, all_downloadable[vid]) for vid in matched if not _already_downloaded(vid)]
+    already = len(matched) - len(pending)
+
+    print(f"  {len(matched)} matching clips — {already} already on disk, {len(pending)} to download.")
+
+    if pending:
+        failed = _run_downloads(yt_dlp, pending)
+        if failed:
+            print(f"  {len(failed)} failed downloads (skipped).")
+
+    on_disk = sum(1 for vid in matched if _already_downloaded(vid))
+    print(f"  {on_disk} clips ready for training/eval.")
     VIDEOS_SENTINEL.touch()
-    print(f"\nDone. Videos in: {VIDEOS_DIR}")
+    return on_disk
+
+
+def cleanup_all_videos() -> int:
+    """
+    Delete all video files from the videos directory.
+    Returns the number of files deleted.
+    """
+    if not VIDEOS_DIR.exists():
+        return 0
+
+    deleted = 0
+    for f in VIDEOS_DIR.iterdir():
+        if f.suffix in VIDEO_EXTS:
+            f.unlink()
+            deleted += 1
+
+    print(f"  Removed {deleted} video file(s) from {VIDEOS_DIR}")
+    return deleted
+
+
+def download_for_targets(
+    targets: list,
+    max_per_target: int = 300,
+    annotation_file: str = None,
+) -> None:
+    """Convenience wrapper around ensure_videos_for_targets with a per-target cap."""
+    ensure_videos_for_targets(
+        targets         = targets,
+        annotation_file = annotation_file,
+        max_per_target  = max_per_target,
+    )
+
+
+# ── legacy bulk download (first-time setup) ───────────────────────────────────
+
+def main(max_videos: int = DEFAULT_MAX_VIDEOS) -> None:
+    """
+    Legacy: download the first max_videos from the mask-covered set.
+    Used only by the first-time setup in NSAP.py — attacks use
+    ensure_videos_for_targets() instead.
+    """
+    # In the new on-demand model the initial setup skips bulk downloads;
+    # just touch the sentinel so the setup check passes.
+    VIDEOS_DIR.mkdir(parents=True, exist_ok=True)
+    VIDEOS_SENTINEL.touch()
+    print(f"  Video download deferred to per-attack on-demand mode.")
+    print(f"  Run: python run_attack.py --mode <mode> --target <target>")
+    print(f"  Videos will be downloaded automatically before each attack.")
 
 
 if __name__ == "__main__":

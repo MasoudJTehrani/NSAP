@@ -10,6 +10,42 @@ DINO_MEAN = [0.485, 0.456, 0.406]
 DINO_STD  = [0.229, 0.224, 0.225]
 
 
+def clip_scores(
+    vine_model,
+    clip_encoder,
+    img_hwc: torch.Tensor,
+    keywords,
+    device,
+    clip_image_size: int,
+) -> torch.Tensor:
+    """
+    Differentiable CLIP forward for one image — the single train-side mirror of
+    VineModel's eval scoring. Returns a [N_keywords] score tensor
+    (cosine similarity × logit_scale); gradients flow back through img_hwc.
+
+    img_hwc must already be the head-appropriate image, matching eval:
+      - category/attribute: extract_single_object_torch output (FULL frame)
+      - relation:           extract_object_subject_torch → crop to union of bboxes
+
+    All preprocessing (BGR swap, resize-shortest-edge + center-crop, normalize)
+    and tokenisation (pad to max_length=75) match the eval path exactly, so a
+    falling training loss transfers to flip rate. Used by train.py and the anchor
+    warmups; keep this the ONLY train-side forward to prevent drift.
+    """
+    pv       = clip_preprocess_torch(img_hwc, clip_image_size)    # [1,3,H,W]
+    img_feat = clip_image_features(clip_encoder, pv)              # [1, D]
+
+    text_tokens = vine_model.clip_tokenizer(
+        keywords, return_tensors='pt', max_length=75, truncation=True, padding='max_length'
+    ).to(device)
+    text_feat = clip_text_features(clip_encoder, **text_tokens)   # [N, D]
+
+    img_n  = img_feat  / img_feat.norm(p=2, dim=-1, keepdim=True)
+    text_n = text_feat / text_feat.norm(p=2, dim=-1, keepdim=True)
+    logit_scale = clip_encoder.logit_scale.exp() if hasattr(clip_encoder, 'logit_scale') else 1.0
+    return (img_n @ text_n.T).squeeze(0) * logit_scale            # [N]
+
+
 def clip_image_features(clip_model, pixel_values: torch.Tensor) -> torch.Tensor:
     """
     Extract CLIP projected image features as a [B, D] tensor.
@@ -175,17 +211,41 @@ def clip_preprocess_torch(img_hwc: torch.Tensor, image_size: int = 224) -> torch
     """
     Differentiable CLIP image preprocessing. Replaces CLIPProcessor for gradient flow.
 
-    Resize → scale to [0,1] → normalize with CLIP mean/std.
+    This MUST match VineModel's eval path (VineModel._extract_image_features →
+    CLIPProcessor) op-for-op, or a patch trained through it will not transfer to
+    eval. Verified to reproduce the eval image features to cosine 1.0000.
+
+    The eval path applies, in order:
+      1. cv2.cvtColor(img, BGR2RGB) on an already-RGB frame — i.e. a channel
+         REVERSAL, so CLIP actually receives the image in BGR order. We mirror it.
+      2. CLIPImageProcessor: resize the SHORTEST edge to image_size (bicubic,
+         antialiased), center-crop image_size × image_size, rescale 1/255,
+         normalize with CLIP mean/std. NOTE: this is resize-shortest-edge +
+         center-crop, NOT a squash to a square — getting this wrong shifts the
+         object scale and silently degrades transfer.
 
     Args:
         img_hwc:    [H, W, 3] float tensor, RGB, values in [0, 255]
         image_size: target spatial size (224 for ViT-B/32, 336 for ViT-L/14-336)
 
     Returns:
-        [1, 3, image_size, image_size] float tensor, ready for clip_model.get_image_features(pixel_values=...)
+        [1, 3, image_size, image_size] float tensor, ready for clip vision_model
     """
-    x = img_hwc.permute(2, 0, 1).unsqueeze(0).float()   # [1, 3, H, W]
-    x = F.interpolate(x, size=(image_size, image_size), mode='bilinear', align_corners=False)
+    x = img_hwc.permute(2, 0, 1).unsqueeze(0).float()   # [1, 3, H, W], RGB
+    x = x[:, [2, 1, 0], :, :]                           # RGB → BGR  (mirrors cvtColor, step 1)
+
+    # Resize shortest edge → image_size, preserving aspect ratio (step 2a)
+    h, w = x.shape[-2], x.shape[-1]
+    scale = image_size / min(h, w)
+    new_h, new_w = int(round(h * scale)), int(round(w * scale))
+    x = F.interpolate(x, size=(new_h, new_w), mode='bicubic',
+                      align_corners=False, antialias=True)
+
+    # Center crop image_size × image_size (step 2b)
+    top  = (new_h - image_size) // 2
+    left = (new_w - image_size) // 2
+    x = x[..., top:top + image_size, left:left + image_size]
+
     x = x / 255.0
     mean = torch.tensor(CLIP_MEAN, device=x.device, dtype=x.dtype).view(1, 3, 1, 1)
     std  = torch.tensor(CLIP_STD,  device=x.device, dtype=x.dtype).view(1, 3, 1, 1)

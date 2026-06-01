@@ -1,22 +1,28 @@
 """
 SAM-guided adversarial anchor selection (Phase 0).
 
-For each target category, runs a short warm-up for each SAM sub-region candidate
-and selects the anchor that maximises attack effectiveness (lowest CW loss after
-warmup). This is run once per category before the main training loop.
+The anchor is stored as a (dx, dy) pixel offset relative to the TARGET OBJECT'S
+bbox center.  At paste time use anchor_center(anchor, bbox) which applies the
+offset and then CLAMPS the result to within the bbox — this ensures the patch
+always lands on the target object even when the eval bbox is smaller than the
+training bbox used to derive the offset.
 """
 
 import torch
 import torch.optim as optim
 import numpy as np
-from typing import List, Tuple, Optional, NamedTuple
+from typing import List, Tuple, NamedTuple
 import copy
 
 
 class Anchor(NamedTuple):
-    cx: int      # x-center (column) of the selected anchor
-    cy: int      # y-center (row) of the selected anchor
-    label: str   # informal description (e.g. "sub-mask-0")
+    dx: int      # x-offset from bbox center in pixels (positive = right)
+    dy: int      # y-offset from bbox center in pixels (positive = down)
+    label: str   # informal description (e.g. "sam-anchor-0")
+
+
+def _bbox_center(bbox: dict) -> Tuple[int, int]:
+    return (bbox['x1'] + bbox['x2']) // 2, (bbox['y1'] + bbox['y2']) // 2
 
 
 def _mask_centroid(mask_np: np.ndarray) -> Tuple[int, int]:
@@ -33,13 +39,12 @@ def _get_sam_anchors(
     sam_predictor,
 ) -> List[Tuple[int, int]]:
     """
-    Use SAM2 with a box prompt to obtain sub-region candidates within the object bbox.
-    Returns a list of (cx, cy) centroid positions — one per predicted mask.
+    Use SAM2 with a box prompt to obtain sub-region candidates within bbox.
+    Returns a list of ABSOLUTE (cx, cy) centroids — callers convert to relative.
     Falls back to the bbox center if SAM is unavailable.
     """
     if sam_predictor is None:
-        cx = (bbox['x1'] + bbox['x2']) // 2
-        cy = (bbox['y1'] + bbox['y2']) // 2
+        cx, cy = _bbox_center(bbox)
         return [(cx, cy)]
 
     box_np = np.array([bbox['x1'], bbox['y1'], bbox['x2'], bbox['y2']], dtype=float)
@@ -48,24 +53,42 @@ def _get_sam_anchors(
         sam_predictor.set_image(image_rgb)
         masks, _, _ = sam_predictor.predict(
             box=box_np,
-            multimask_output=True,  # returns 3 masks of varying granularity
+            multimask_output=True,
         )
         anchors = [_mask_centroid(m) for m in masks]
-        # Also include the geometric center of the bbox as a baseline candidate
-        cx_geo = (bbox['x1'] + bbox['x2']) // 2
-        cy_geo = (bbox['y1'] + bbox['y2']) // 2
-        anchors.append((cx_geo, cy_geo))
+        # Include the geometric bbox center as a baseline
+        anchors.append(_bbox_center(bbox))
         return anchors
     except Exception as e:
         print(f"SAM prediction failed ({e}), falling back to bbox center")
-        cx = (bbox['x1'] + bbox['x2']) // 2
-        cy = (bbox['y1'] + bbox['y2']) // 2
-        return [(cx, cy)]
+        return [_bbox_center(bbox)]
+
+
+def _abs_to_rel(cx: int, cy: int, bbox: dict) -> Tuple[int, int]:
+    """Convert an absolute centroid to a (dx, dy) pixel offset from the bbox center."""
+    bcx, bcy = _bbox_center(bbox)
+    return cx - bcx, cy - bcy
+
+
+def anchor_center(anchor: 'Anchor', bbox: dict) -> Tuple[int, int]:
+    """
+    Compute the absolute (cx, cy) paste center for an Anchor on a given bbox.
+
+    Applies the pixel offset and then clamps the result to within the bbox, so
+    the patch always lands on the target object even when the eval bbox is
+    smaller than the training bboxes that produced the anchor offset.
+    """
+    bcx, bcy = _bbox_center(bbox)
+    cx = bcx + anchor.dx
+    cy = bcy + anchor.dy
+    cx = max(int(bbox['x1']), min(int(bbox['x2']), cx))
+    cy = max(int(bbox['y1']), min(int(bbox['y2']), cy))
+    return cx, cy
 
 
 def _evaluate_anchor(
-    anchor_cx: int,
-    anchor_cy: int,
+    anchor_dx: int,
+    anchor_dy: int,
     instances: list,
     vine_model: torch.nn.Module,
     clip_encoder,
@@ -78,83 +101,75 @@ def _evaluate_anchor(
     target_attribute: str = '',
 ) -> float:
     """
-    Evaluate one anchor candidate by running warmup_steps gradient steps on a random
-    patch placed at (anchor_cx, anchor_cy) and returning the final average CW loss.
-
-    Lower returned loss = attack succeeded more easily = better anchor.
+    Evaluate one anchor candidate (relative offset dx, dy) by running
+    warmup_steps gradient steps and returning the final average CW loss.
+    Lower returned loss = better anchor.
     """
     from functions.attack.patch import AdversarialPatch, paste_patch, compute_patch_size
     from functions.attack.preprocess import (
-        clip_image_features,
-        clip_text_features,
+        clip_scores,
         extract_single_object_torch,
-        extract_object_subject_torch,
-        crop_image_contain_bboxes_torch,
-        clip_preprocess_torch,
     )
     from functions.attack.losses import l_attack_cw
 
-    # Use a small subset for the warm-up evaluation
     eval_instances = instances[:min(len(instances), 20)]
     if len(eval_instances) == 0:
         return float('inf')
 
-    # Initialise a fresh patch for this candidate
-    sample_bbox = eval_instances[0]['bbox']
+    # For anchor evaluation we need instances with ≥2 keywords so the CW loss
+    # has something to distinguish.  The first N instances might all come from
+    # a single clip with a 1-word vocabulary, so search the full list.
+    target_str = target_attribute if attack_mode == 'attribute' else target_category
+    kw_key     = 'unary_kws' if attack_mode == 'attribute' else 'consts'
+    cw_eval_instances = []
+    for inst in eval_instances + list(instances):   # eval_subset first, then full list
+        spec = inst['gpt_spec']
+        kws  = spec.get(kw_key, [])
+        cidx = next((i for i, c in enumerate(kws) if target_str.lower() in c.lower()), None)
+        if cidx is not None and len(kws) >= 2:
+            cw_eval_instances.append((inst, kws, cidx))
+        if len(cw_eval_instances) >= 20:
+            break
+
+    if not cw_eval_instances:
+        # No multi-class instances found — anchor evaluation cannot use CW loss;
+        # skip warmup and return 0 (all anchors are equivalent).
+        return 0.0
+
+    sample_bbox = cw_eval_instances[0][0]['bbox']
     patch_h, patch_w = compute_patch_size(sample_bbox, coverage_ratio)
     patch = AdversarialPatch(patch_h, patch_w, device)
     optimizer = optim.Adam(patch.parameters(), lr=0.01)
 
-    # Choose keywords and correct_idx based on attack mode
-    spec = eval_instances[0]['gpt_spec']
-    if attack_mode == 'attribute':
-        keywords = spec.get('unary_kws', [])
-        correct_idx = next(
-            (i for i, c in enumerate(keywords) if target_attribute.lower() in c.lower()), 0
-        )
-    else:
-        keywords = spec.get('consts', [])
-        correct_idx = next(
-            (i for i, c in enumerate(keywords) if target_category.lower() in c.lower()), 0
-        )
-
     for _ in range(warmup_steps):
-        total = torch.tensor(0.0, device=device)
+        total     = torch.tensor(0.0, device=device)
+        n_counted = 0
         optimizer.zero_grad()
 
-        for inst in eval_instances:
+        for inst, inst_kws, inst_correct_idx in cw_eval_instances:
+
             frame = inst['frame'].to(device)
             mask  = inst['mask'].to(device)
             bbox  = inst['bbox']
             ph, pw = compute_patch_size(bbox, coverage_ratio)
 
-            patched = paste_patch(frame, patch.pixels_hwc, anchor_cx, anchor_cy, ph, pw)
+            bcx, bcy = _bbox_center(bbox)
+            cx = max(int(bbox['x1']), min(int(bbox['x2']), bcx + anchor_dx))
+            cy = max(int(bbox['y1']), min(int(bbox['y2']), bcy + anchor_dy))
 
-            if attack_mode in ('category', 'attribute'):
-                proc = extract_single_object_torch(patched, mask)
-                crop = crop_image_contain_bboxes_torch(proc, [bbox])
-            else:
-                raise ValueError(f"Use select_relation_anchor for attack_mode='relation'")
+            patched = paste_patch(frame, patch.pixels_hwc, cx, cy, ph, pw)
 
-            pv   = clip_preprocess_torch(crop, clip_image_size).to(device)
-            feat = clip_image_features(clip_encoder, pv)
+            # category/attribute: eval classifies on the FULL frame (no bbox crop)
+            proc   = extract_single_object_torch(patched, mask, alpha=vine_model.config.alpha)
+            scores = clip_scores(vine_model, clip_encoder, proc, inst_kws, device, clip_image_size)
 
-            text_tokens = vine_model.clip_tokenizer(
-                keywords, return_tensors='pt', padding=True, truncation=True, max_length=75
-            ).to(device)
-            text_feat = clip_text_features(clip_encoder, **text_tokens)
+            total     = total + l_attack_cw(scores, inst_correct_idx)
+            n_counted += 1
 
-            img_feat_n  = feat / feat.norm(p=2, dim=-1, keepdim=True)
-            text_feat_n = text_feat / text_feat.norm(p=2, dim=-1, keepdim=True)
-            scores = (img_feat_n @ text_feat_n.T).squeeze(0)
-
-            total = total + l_attack_cw(scores, correct_idx)
-
-        (total / len(eval_instances)).backward()
+        (total / n_counted).backward()
         optimizer.step()
 
-    # Return final loss value (lower = better anchor)
-    return total.item() / len(eval_instances)
+    return total.item() / n_counted
 
 
 def select_anchor(
@@ -170,22 +185,8 @@ def select_anchor(
     target_attribute: str = '',
 ) -> Anchor:
     """
-    Select the best anchor position for the universal adversarial patch via SAM-guided
+    Select the best anchor (relative offset from bbox center) via SAM-guided
     candidate generation followed by warm-up loss evaluation.
-
-    Args:
-        instances:       flat list from EscaAttackDataset.build_instance_list()
-        vine_model:      loaded VineModel (for tokenizer + CLIP encoders)
-        attack_mode:     'category', 'attribute', or 'relation'
-        target_category: string category name being attacked (e.g. 'person')
-        coverage_ratio:  patch coverage fraction of bbox (default 0.3)
-        warmup_steps:    gradient steps per anchor candidate (default 20)
-        device:          torch device (defaults to vine_model device)
-        sam_predictor:   SAM2ImagePredictor instance, or None to skip SAM
-        clip_image_size: CLIP image input size (224 or 336)
-
-    Returns:
-        Anchor(cx, cy, label)
     """
     if device is None:
         device = next(vine_model.parameters()).device
@@ -193,27 +194,24 @@ def select_anchor(
     if attack_mode not in ('category', 'attribute'):
         raise ValueError("Use select_relation_anchor() for relation attack mode.")
 
-    # Sample a small set of representative instances for anchor evaluation
     eval_subset = instances[:min(len(instances), 100)]
     if len(eval_subset) == 0:
         raise ValueError("No instances available for anchor selection.")
 
-    # Gather anchor candidates across instances (centroid of SAM sub-masks)
-    candidate_votes: dict = {}   # (cx, cy) -> cumulative vote count
+    # Gather relative-offset candidates (convert SAM absolute → relative per instance)
+    candidate_votes: dict = {}   # (dx, dy) -> cumulative vote count
 
-    for inst in eval_subset[:20]:   # use first 20 for SAM (expensive step)
+    for inst in eval_subset[:20]:
         frame_np = inst['frame'].numpy().astype(np.uint8)
         bbox     = inst['bbox']
-        anchors  = _get_sam_anchors(frame_np, bbox, sam_predictor)
-        for cx, cy in anchors:
-            candidate_votes[(cx, cy)] = candidate_votes.get((cx, cy), 0) + 1
+        abs_anchors = _get_sam_anchors(frame_np, bbox, sam_predictor)
+        for cx, cy in abs_anchors:
+            dx, dy = _abs_to_rel(cx, cy, bbox)
+            candidate_votes[(dx, dy)] = candidate_votes.get((dx, dy), 0) + 1
 
-    # Deduplicate nearby candidates (merge within 5% of image size)
     candidates = list(candidate_votes.keys())
-    if len(candidates) == 0:
-        # Fallback to bbox center of first instance
-        bbox = eval_subset[0]['bbox']
-        candidates = [((bbox['x1'] + bbox['x2']) // 2, (bbox['y1'] + bbox['y2']) // 2)]
+    if not candidates:
+        candidates = [(0, 0)]   # fallback: bbox center
 
     print(f"Evaluating {len(candidates)} anchor candidates with {warmup_steps} warmup steps each...")
 
@@ -222,33 +220,33 @@ def select_anchor(
         else vine_model.clip_unary_model
     )
 
-    best_loss = float('inf')
-    best_cx, best_cy = candidates[0]
+    best_loss  = float('inf')
+    best_dx, best_dy = candidates[0]
     best_label = "anchor-0"
 
-    for idx, (cx, cy) in enumerate(candidates):
+    for idx, (dx, dy) in enumerate(candidates):
         loss = _evaluate_anchor(
-            anchor_cx=cx,
-            anchor_cy=cy,
-            instances=eval_subset,
-            vine_model=vine_model,
-            clip_encoder=clip_encoder,
-            attack_mode=attack_mode,
-            target_category=target_category,
-            coverage_ratio=coverage_ratio,
-            warmup_steps=warmup_steps,
-            device=device,
-            clip_image_size=clip_image_size,
-            target_attribute=target_attribute,
+            anchor_dx        = dx,
+            anchor_dy        = dy,
+            instances        = eval_subset,
+            vine_model       = vine_model,
+            clip_encoder     = clip_encoder,
+            attack_mode      = attack_mode,
+            target_category  = target_category,
+            coverage_ratio   = coverage_ratio,
+            warmup_steps     = warmup_steps,
+            device           = device,
+            clip_image_size  = clip_image_size,
+            target_attribute = target_attribute,
         )
-        print(f"  candidate {idx} ({cx}, {cy}): warmup loss = {loss:.4f}")
+        print(f"  candidate {idx} (dx={dx}, dy={dy}): warmup loss = {loss:.4f}")
         if loss < best_loss:
             best_loss = loss
-            best_cx, best_cy = cx, cy
+            best_dx, best_dy = dx, dy
             best_label = f"sam-anchor-{idx}"
 
-    print(f"Selected anchor: ({best_cx}, {best_cy}) [{best_label}] with loss {best_loss:.4f}")
-    return Anchor(cx=best_cx, cy=best_cy, label=best_label)
+    print(f"Selected anchor: (dx={best_dx}, dy={best_dy}) [{best_label}] loss={best_loss:.4f}")
+    return Anchor(dx=best_dx, dy=best_dy, label=best_label)
 
 
 def select_relation_anchor(
@@ -263,8 +261,7 @@ def select_relation_anchor(
 ) -> Anchor:
     """
     Select the best anchor on the SUBJECT's bbox for the relation attack.
-    Same SAM + warmup approach as select_anchor but uses the pair crop
-    and clip_binary_model for the warm-up loss.
+    Returns relative (dx, dy) offset from the subject bbox center.
     """
     if device is None:
         device = next(vine_model.parameters()).device
@@ -277,38 +274,36 @@ def select_relation_anchor(
     for inst in eval_subset[:20]:
         frame_np  = inst['frame'].numpy().astype(np.uint8)
         subj_bbox = inst['subj_bbox']
-        anchors   = _get_sam_anchors(frame_np, subj_bbox, sam_predictor)
-        for cx, cy in anchors:
-            candidate_votes[(cx, cy)] = candidate_votes.get((cx, cy), 0) + 1
+        abs_anchors = _get_sam_anchors(frame_np, subj_bbox, sam_predictor)
+        for cx, cy in abs_anchors:
+            dx, dy = _abs_to_rel(cx, cy, subj_bbox)
+            candidate_votes[(dx, dy)] = candidate_votes.get((dx, dy), 0) + 1
 
     candidates = list(candidate_votes.keys())
     if not candidates:
-        bbox = eval_subset[0]['subj_bbox']
-        candidates = [((bbox['x1'] + bbox['x2']) // 2, (bbox['y1'] + bbox['y2']) // 2)]
+        candidates = [(0, 0)]
 
     from functions.attack.patch import AdversarialPatch, paste_patch, compute_patch_size
     from functions.attack.preprocess import (
-        clip_image_features,
-        clip_text_features,
+        clip_scores,
         extract_object_subject_torch,
         crop_image_contain_bboxes_torch,
-        clip_preprocess_torch,
     )
     from functions.attack.losses import l_attack_cw
 
-    binary_kws = eval_subset[0]['gpt_spec'].get('binary_kws', [])
+    binary_kws  = eval_subset[0]['gpt_spec'].get('binary_kws', [])
     correct_idx = next(
         (i for i, k in enumerate(binary_kws) if target_relation.lower() in k.lower()),
         0,
     )
 
-    best_loss = float('inf')
-    best_cx, best_cy = candidates[0]
+    best_loss  = float('inf')
+    best_dx, best_dy = candidates[0]
     best_label = "relation-anchor-0"
 
     print(f"Evaluating {len(candidates)} relation anchor candidates...")
 
-    for idx, (cx, cy) in enumerate(candidates):
+    for idx, (dx, dy) in enumerate(candidates):
         sample_bbox = eval_subset[0]['subj_bbox']
         patch_h, patch_w = compute_patch_size(sample_bbox, coverage_ratio)
         patch     = AdversarialPatch(patch_h, patch_w, device)
@@ -325,30 +320,30 @@ def select_relation_anchor(
                 obj_bbox   = inst['obj_bbox']
                 ph, pw     = compute_patch_size(subj_bbox, coverage_ratio)
 
-                patched = paste_patch(frame, patch.pixels_hwc, cx, cy, ph, pw)
-                proc    = extract_object_subject_torch(patched, subj_mask, obj_mask)
-                crop    = crop_image_contain_bboxes_torch(proc, [subj_bbox, obj_bbox])
-                pv      = clip_preprocess_torch(crop, clip_image_size).to(device)
-                feat    = clip_image_features(vine_model.clip_binary_model, pv)
+                bcx, bcy = _bbox_center(subj_bbox)
+                cx = max(int(subj_bbox['x1']), min(int(subj_bbox['x2']), bcx + dx))
+                cy = max(int(subj_bbox['y1']), min(int(subj_bbox['y2']), bcy + dy))
 
-                text_tokens = vine_model.clip_tokenizer(
-                    binary_kws, return_tensors='pt', padding=True, truncation=True, max_length=75
-                ).to(device)
-                text_feat   = clip_text_features(vine_model.clip_binary_model, **text_tokens)
-                img_n  = feat  / feat.norm(p=2, dim=-1, keepdim=True)
-                text_n = text_feat / text_feat.norm(p=2, dim=-1, keepdim=True)
-                scores = (img_n @ text_n.T).squeeze(0)
+                patched = paste_patch(frame, patch.pixels_hwc, cx, cy, ph, pw)
+                # relation: eval crops to the union of subject+object bboxes
+                proc    = extract_object_subject_torch(
+                    patched, subj_mask, obj_mask,
+                    alpha=vine_model.config.alpha, white_alpha=vine_model.config.white_alpha,
+                )
+                crop    = crop_image_contain_bboxes_torch(proc, [subj_bbox, obj_bbox])
+                scores  = clip_scores(vine_model, vine_model.clip_binary_model,
+                                      crop, binary_kws, device, clip_image_size)
                 total  = total + l_attack_cw(scores, correct_idx)
 
             (total / len(eval_subset[:20])).backward()
             optimizer.step()
 
         loss_val = total.item() / len(eval_subset[:20])
-        print(f"  candidate {idx} ({cx}, {cy}): warmup loss = {loss_val:.4f}")
+        print(f"  candidate {idx} (dx={dx}, dy={dy}): warmup loss = {loss_val:.4f}")
         if loss_val < best_loss:
             best_loss  = loss_val
-            best_cx, best_cy = cx, cy
+            best_dx, best_dy = dx, dy
             best_label = f"relation-sam-anchor-{idx}"
 
-    print(f"Selected relation anchor: ({best_cx}, {best_cy}) with loss {best_loss:.4f}")
-    return Anchor(cx=best_cx, cy=best_cy, label=best_label)
+    print(f"Selected relation anchor: (dx={best_dx}, dy={best_dy}) loss={best_loss:.4f}")
+    return Anchor(dx=best_dx, dy=best_dy, label=best_label)

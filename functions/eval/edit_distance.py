@@ -3,31 +3,69 @@ Scene graph edit distance — proves attack isolation.
 
 All metrics are computed on the TARGET object(s) only:
   - category/attribute attack: objects whose clean-SG category matches target_category
+    (and whose clean-SG attribute matches target_attribute for attribute mode)
   - relation attack: (subj, obj) pairs whose clean-SG relation matches target_relation
+
+For each target object the patch is applied only to THAT object across every
+frame where it appears; then the full multi-frame scene graph is re-predicted
+and compared against the clean graph.  This mirrors the real-world scenario
+where a single person wears the physical patch.
 
 Per-object rates are normalised by n_target_objects so they are comparable
 across clips regardless of how many objects the clip contains.
 """
 
+import torch
 from typing import Dict, Tuple
 from dataclasses import dataclass, field
 from functions.eval.scene_graph import SceneGraph
 
 
+# ── shared helper ─────────────────────────────────────────────────────────────
+
+def _patch_object_across_frames(
+    clean_frames: list,
+    bboxes: dict,
+    patch,
+    anchor,
+    config,
+    device: torch.device,
+    obj_id: int,
+) -> list:
+    """
+    Return a copy of clean_frames with the patch applied only to obj_id
+    in every frame where that object appears.
+    """
+    from functions.attack.patch import paste_patch, compute_patch_size
+    from functions.attack.anchor import anchor_center
+
+    patched = []
+    for frame_id, frame in enumerate(clean_frames):
+        frame_bboxes = bboxes.get(frame_id, {})
+        if obj_id in frame_bboxes:
+            bbox   = frame_bboxes[obj_id]
+            ph, pw = compute_patch_size(bbox, config.coverage_ratio)
+            cx, cy = anchor_center(anchor, bbox)
+            f = paste_patch(
+                frame.clone().to(device), patch.pixels_hwc, cx, cy, ph, pw,
+            ).cpu()
+        else:
+            f = frame
+        patched.append(f)
+    return patched
+
+
+# ── result dataclass ──────────────────────────────────────────────────────────
+
 @dataclass
 class EditDistanceResult:
-    # How many target objects were found in the clean scene graph
     n_target_objects: int = 0
-    # How many target relations were found (relation mode only)
     n_target_relations: int = 0
 
-    # Raw change counts on target objects
-    category_changes: int = 0    # target objects whose category label changed
-    attribute_changes: int = 0   # target objects whose attribute label changed
-    relation_changes: int = 0    # target relations that changed (relation mode)
-    target_disappeared: int = 0  # target objects absent from attacked SG
-
-    # ── rates (normalised by n_target_objects / n_target_relations) ──────────
+    category_changes: int = 0
+    attribute_changes: int = 0
+    relation_changes: int = 0
+    target_disappeared: int = 0
 
     @property
     def _obj_denom(self) -> int:
@@ -83,37 +121,39 @@ def _match(label: str, target: str) -> bool:
     return target.lower() in label.lower()
 
 
+# ── utility (kept for external / testing use) ─────────────────────────────────
+
 def compute_edit_distance(
     sg_clean: SceneGraph,
     sg_attacked: SceneGraph,
     attack_mode: str = 'category',
     target_category: str = '',
     target_relation: str = '',
+    target_attribute: str = '',
 ) -> EditDistanceResult:
     """
-    Compute edit distance restricted to the target object(s).
+    Compute edit distance restricted to the target object(s) given two
+    pre-computed scene graphs.
 
-    Args:
-        sg_clean:        SceneGraph from original un-patched frames
-        sg_attacked:     SceneGraph from patched frames
-        attack_mode:     'category', 'attribute', or 'relation'
-        target_category: category string being attacked (e.g. 'camera')
-        target_relation: relation string being attacked (e.g. 'wearing')
-
-    Returns:
-        EditDistanceResult with per-target-object rates
+    NOTE: the caller is responsible for ensuring sg_attacked was produced
+    with the correct patching strategy.  For batch evaluation use
+    evaluate_isolation() instead.
     """
     result = EditDistanceResult()
 
-    # ── Identify target objects ───────────────────────────────────────────────
     if attack_mode in ('category', 'attribute'):
         target_obj_ids = {
             obj_id for obj_id, cat in sg_clean.categories.items()
             if _match(cat, target_category)
         } if target_category else set(sg_clean.categories.keys())
 
-        result.n_target_objects = len(target_obj_ids)
+        if attack_mode == 'attribute' and target_attribute:
+            target_obj_ids = {
+                obj_id for obj_id in target_obj_ids
+                if _match(sg_clean.attributes.get(obj_id, ''), target_attribute)
+            }
 
+        result.n_target_objects = len(target_obj_ids)
         attacked_obj_ids = set(sg_attacked.categories.keys())
         result.target_disappeared = len(target_obj_ids - attacked_obj_ids)
 
@@ -134,7 +174,6 @@ def compute_edit_distance(
             if _match(rel, target_relation)
         } if target_relation else set(sg_clean.relations.keys())
 
-        # Optionally filter by subject category
         if target_category:
             target_pairs = {
                 pair for pair in target_pairs
@@ -142,7 +181,6 @@ def compute_edit_distance(
             }
 
         result.n_target_relations = len(target_pairs)
-        # Use target subjects as the "target objects" for rate normalisation
         target_obj_ids = {pair[0] for pair in target_pairs}
         result.n_target_objects = len(target_obj_ids)
 
@@ -169,6 +207,8 @@ def compute_edit_distance(
     return result
 
 
+# ── main evaluation entry point ───────────────────────────────────────────────
+
 def evaluate_isolation(
     vine_model,
     clip_items: list,
@@ -180,16 +220,20 @@ def evaluate_isolation(
     """
     Compute target-object edit distance and isolation over test clips.
 
-    Returns dict with per-rate metrics (all normalised by n_target_objects):
-        mean_n_target_objects     float  — avg target objects per clip
-        mean_category_change_rate float  — fraction of target objs whose category changed
-        mean_attribute_change_rate float — fraction of target objs whose attribute changed
-        mean_relation_change_rate  float — fraction of target relations that changed
-        mean_disappear_rate        float — fraction of target objs that disappeared
-        mean_isolation_score       float — fraction of changes on the attacked head
+    For each target object the patch is applied only to THAT object across
+    every frame where it appears (other objects left clean).  Changes on all
+    three heads (category, attribute, relation) are measured for that object,
+    giving a true picture of attack focus vs collateral damage.
+
+    Returns dict with per-rate metrics (normalised by n_target_objects):
+        mean_n_target_objects     float
+        mean_category_change_rate float
+        mean_attribute_change_rate float
+        mean_relation_change_rate  float
+        mean_disappear_rate        float
+        mean_isolation_score       float
         per_clip                   list[EditDistanceResult]
     """
-    from functions.attack.patch import paste_patch, compute_patch_size
     from functions.eval.scene_graph import predict_scene_graph
 
     all_edits = []
@@ -203,28 +247,93 @@ def evaluate_isolation(
         bboxes       = item['bboxes']
         gpt_spec     = item['gpt_spec']
 
-        patched_frames = []
-        for frame_id, frame in enumerate(clean_frames):
-            frame_bboxes = bboxes.get(frame_id, {})
-            patched      = frame.clone()
-            for obj_id, bbox in frame_bboxes.items():
-                ph, pw  = compute_patch_size(bbox, config.coverage_ratio)
-                patched = paste_patch(
-                    patched.to(device), patch.pixels_hwc,
-                    anchor.cx, anchor.cy, ph, pw,
+        sg_clean = predict_scene_graph(vine_model, clean_frames, masks, bboxes, gpt_spec, device)
+        clip_result = EditDistanceResult()
+
+        if config.attack_mode in ('category', 'attribute'):
+            target_obj_ids = {
+                oid for oid, cat in sg_clean.categories.items()
+                if config.target_category.lower() in cat.lower()
+            } if config.target_category else set(sg_clean.categories.keys())
+
+            if config.attack_mode == 'attribute' and getattr(config, 'target_attribute', ''):
+                target_obj_ids = {
+                    oid for oid in target_obj_ids
+                    if config.target_attribute.lower() in (sg_clean.attributes.get(oid) or '').lower()
+                }
+
+            clip_result.n_target_objects = len(target_obj_ids)
+
+            for obj_id in target_obj_ids:
+                patched_frames = _patch_object_across_frames(
+                    clean_frames, bboxes, patch, anchor, config, device, obj_id,
                 )
-            patched_frames.append(patched.cpu())
+                sg_patched = predict_scene_graph(
+                    vine_model, patched_frames, masks, bboxes, gpt_spec, device,
+                )
 
-        sg_clean    = predict_scene_graph(vine_model, clean_frames,   masks, bboxes, gpt_spec, device)
-        sg_attacked = predict_scene_graph(vine_model, patched_frames, masks, bboxes, gpt_spec, device)
+                if obj_id not in sg_patched.categories:
+                    clip_result.target_disappeared += 1
+                    continue
 
-        ed = compute_edit_distance(
-            sg_clean, sg_attacked,
-            attack_mode      = config.attack_mode,
-            target_category  = config.target_category,
-            target_relation  = config.target_relation,
-        )
-        all_edits.append(ed)
+                clean_cat  = sg_clean.categories.get(obj_id)
+                patch_cat  = sg_patched.categories.get(obj_id)
+                if clean_cat and patch_cat and clean_cat != patch_cat:
+                    clip_result.category_changes += 1
+
+                clean_attr = sg_clean.attributes.get(obj_id)
+                patch_attr = sg_patched.attributes.get(obj_id)
+                if clean_attr and patch_attr and clean_attr != patch_attr:
+                    clip_result.attribute_changes += 1
+
+        elif config.attack_mode == 'relation':
+            target_pairs = {
+                pair for pair, rel in sg_clean.relations.items()
+                if config.target_relation.lower() in rel.lower()
+            } if config.target_relation else set(sg_clean.relations.keys())
+
+            if config.target_category:
+                target_pairs = {
+                    p for p in target_pairs
+                    if config.target_category.lower() in sg_clean.categories.get(p[0], '').lower()
+                }
+
+            target_subj_ids = {pair[0] for pair in target_pairs}
+            clip_result.n_target_relations = len(target_pairs)
+            clip_result.n_target_objects   = len(target_subj_ids)
+
+            # Per unique subject: patch it, then check relation + category + attribute
+            for subj_id in target_subj_ids:
+                patched_frames = _patch_object_across_frames(
+                    clean_frames, bboxes, patch, anchor, config, device, subj_id,
+                )
+                sg_patched = predict_scene_graph(
+                    vine_model, patched_frames, masks, bboxes, gpt_spec, device,
+                )
+
+                if subj_id not in sg_patched.categories:
+                    clip_result.target_disappeared += 1
+                    continue
+
+                clean_cat = sg_clean.categories.get(subj_id)
+                patch_cat = sg_patched.categories.get(subj_id)
+                if clean_cat and patch_cat and clean_cat != patch_cat:
+                    clip_result.category_changes += 1
+
+                clean_attr = sg_clean.attributes.get(subj_id)
+                patch_attr = sg_patched.attributes.get(subj_id)
+                if clean_attr and patch_attr and clean_attr != patch_attr:
+                    clip_result.attribute_changes += 1
+
+                for pair in target_pairs:
+                    if pair[0] != subj_id:
+                        continue
+                    clean_rel = sg_clean.relations.get(pair)
+                    patch_rel = sg_patched.relations.get(pair)
+                    if clean_rel and patch_rel and clean_rel != patch_rel:
+                        clip_result.relation_changes += 1
+
+        all_edits.append(clip_result)
 
     if not all_edits:
         return {}

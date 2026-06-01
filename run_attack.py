@@ -41,6 +41,50 @@ def _attack_subdir(base_dir: str, mode: str, target: str, relation: str = "", at
     return os.path.join(base_dir, slug)
 
 
+def _build_download_targets(mode: str, target: str, attribute: str, relation: str) -> list:
+    """Convert attack args to the target-dict format used by download_videos."""
+    t = {}
+    if target:    t['category']  = target
+    if mode == 'attribute' and attribute: t['attribute'] = attribute
+    if mode == 'relation'  and relation:  t['relation']  = relation
+    return [t] if t else []
+
+
+def _ensure_videos(mode: str, target: str, attribute: str, relation: str,
+                   split: str = None) -> None:
+    from functions.download_videos import ensure_videos_for_targets
+    from functions.attack.data import get_split_video_stems
+
+    targets = _build_download_targets(mode, target, attribute, relation)
+    if not targets:
+        return
+
+    split_stems = None
+    if split is not None:
+        stems = get_split_video_stems(
+            dataset_dir      = os.path.join(os.path.dirname(__file__), "dataset"),
+            dataset_filename = "gpt_specs2_id_LLaVA_all.jsonl",
+            target_category  = target   or None,
+            target_attribute = attribute if mode == 'attribute' else None,
+            target_relation  = relation  if mode == 'relation'  else None,
+            split            = split,
+        )
+        split_stems = set(stems)
+        print(f"\n=== Ensuring videos for attack (split='{split}', {len(split_stems)} eligible clips) ===")
+    else:
+        print(f"\n=== Ensuring videos for attack ===")
+
+    n = ensure_videos_for_targets(targets, split_stems=split_stems)
+    if n == 0:
+        print("WARNING: no matching clips found on disk — attack may have no data.")
+
+
+def _cleanup_videos() -> None:
+    from functions.download_videos import cleanup_all_videos
+    print(f"\n=== Cleaning up downloaded videos ===")
+    cleanup_all_videos()
+
+
 def load_vine(device: str) -> "VineModel":
     from model.vine.vine_config import VineConfig
     from model.vine.vine_model import VineModel
@@ -62,6 +106,8 @@ def load_vine(device: str) -> "VineModel":
 
 def run_train(args):
     from functions.attack.train import train_patch, AttackConfig
+
+    _ensure_videos(args.mode, args.target, args.attribute, args.relation, split='train')
 
     attack_dir = _attack_subdir(args.output_dir, args.mode, args.target, args.relation, args.attribute)
 
@@ -104,7 +150,34 @@ def run_train(args):
         sam_predictor    = sam_predictor,
     )
     print("\nTraining complete.")
+
+    if not args.keep_videos:
+        _cleanup_videos()
+
     return patch
+
+
+def run_validate_bboxes(args):
+    """Validate bbox derivation + frame/mask alignment, writing overlay images."""
+    from functions.attack.data import EscaAttackDataset
+    from functions.eval.validate_bboxes import validate_bboxes
+
+    _ensure_videos(args.mode, args.target, args.attribute, args.relation, split='test')
+
+    dataset = EscaAttackDataset(
+        dataset_dir      = os.path.join(os.path.dirname(__file__), "dataset"),
+        dataset_filename = "gpt_specs2_id_LLaVA_all.jsonl",
+        target_category  = args.target or None,
+        target_attribute = args.attribute if args.mode == 'attribute' else None,
+        split            = 'test',
+    )
+
+    attack_dir = _attack_subdir(args.output_dir, args.mode, args.target, args.relation, args.attribute)
+    os.makedirs(attack_dir, exist_ok=True)
+    validate_bboxes(dataset, n_clips=args.n_clips, out_dir=attack_dir)
+
+    if not args.keep_videos:
+        _cleanup_videos()
 
 
 def run_eval(args):
@@ -114,6 +187,7 @@ def run_eval(args):
     from functions.attack.data import EscaAttackDataset
     from functions.eval.flip_rate import compute_flip_rate_across_clips
     from functions.eval.edit_distance import evaluate_isolation
+    from functions.eval.visualize import save_sample_images
 
     device     = args.device
     vine_model = load_vine(device)
@@ -121,6 +195,14 @@ def run_eval(args):
     ckpt = torch.load(args.patch, map_location=device, weights_only=False)
     config: AttackConfig = ckpt['config']
     anchor: Anchor       = ckpt['anchor']
+
+    _ensure_videos(
+        config.attack_mode,
+        config.target_category,
+        getattr(config, 'target_attribute', ''),
+        getattr(config, 'target_relation', ''),
+        split='test',
+    )
 
     ph, pw = ckpt['w'].shape[1], ckpt['w'].shape[2]
     patch  = AdversarialPatch(ph, pw, torch.device(device))
@@ -141,6 +223,8 @@ def run_eval(args):
     flip_results = compute_flip_rate_across_clips(
         vine_model, test_items, patch, anchor, config, torch.device(device)
     )
+    clips_with = flip_results.get('n_clips_with_targets', '?')
+    print(f"Clips with target objects : {clips_with} / {len(test_items)}")
     print(f"Flip rate : {flip_results['flip_rate']:.1%}  "
           f"({flip_results['n_flipped']}/{flip_results['n_total']} target objects flipped)")
 
@@ -190,6 +274,15 @@ def run_eval(args):
         json.dump(results, f, indent=2)
     print(f"\nResults saved to: {results_path}")
 
+    print(f"\n=== Sample Images ===")
+    save_sample_images(
+        vine_model, test_items, patch, anchor, config,
+        torch.device(device), patch_dir, n_samples=10,
+    )
+
+    if not args.keep_videos:
+        _cleanup_videos()
+
 
 def main():
     parser = argparse.ArgumentParser(description="NSAP adversarial patch attack on VINE")
@@ -217,13 +310,27 @@ def main():
     parser.add_argument("--eval",  action="store_true", help="Run evaluation instead of training")
     parser.add_argument("--patch", default=None, help="Path to saved patch .pt file for --eval")
 
+    # Validation
+    parser.add_argument("--validate-bboxes", action="store_true", dest="validate_bboxes",
+                        help="Validate bbox derivation + frame/mask alignment and write overlay images")
+    parser.add_argument("--n-clips", type=int, default=10, dest="n_clips",
+                        help="Number of clips to check for --validate-bboxes")
+
+    # Videos
+    parser.add_argument(
+        "--keep-videos", action="store_true", dest="keep_videos",
+        help="Keep downloaded videos after training/eval (default: delete them)",
+    )
+
     # Misc
     parser.add_argument("--device",     default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--output-dir", default="output/patches", dest="output_dir")
 
     args = parser.parse_args()
 
-    if args.eval:
+    if args.validate_bboxes:
+        run_validate_bboxes(args)
+    elif args.eval:
         if not args.patch:
             parser.error("--eval requires --patch <path>")
         run_eval(args)

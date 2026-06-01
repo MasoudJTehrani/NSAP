@@ -144,33 +144,10 @@ def _diversity_sample(
 # Differentiable VINE forward pass (bypasses numpy preprocessing)
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _clip_scores(
-    vine_model,
-    clip_encoder,
-    crop_hwc: torch.Tensor,
-    keywords: List[str],
-    device: torch.device,
-    clip_image_size: int,
-) -> torch.Tensor:
-    """
-    Run the differentiable CLIP forward pass on a single cropped image.
-    Returns a [N_keywords] score tensor (cosine similarity × logit_scale).
-    Gradients flow back through crop_hwc.
-    """
-    from functions.attack.preprocess import clip_preprocess_torch, clip_image_features, clip_text_features
-
-    pv        = clip_preprocess_torch(crop_hwc, clip_image_size)   # [1,3,H,W]
-    img_feat  = clip_image_features(clip_encoder, pv)              # [1, D]
-
-    text_tokens = vine_model.clip_tokenizer(
-        keywords, return_tensors='pt', padding=True, truncation=True, max_length=75
-    ).to(device)
-    text_feat   = clip_text_features(clip_encoder, **text_tokens)  # [N, D]
-
-    img_n  = img_feat  / img_feat.norm(p=2, dim=-1, keepdim=True)
-    text_n = text_feat / text_feat.norm(p=2, dim=-1, keepdim=True)
-    logit_scale = clip_encoder.logit_scale.exp() if hasattr(clip_encoder, 'logit_scale') else 1.0
-    return (img_n @ text_n.T).squeeze(0) * logit_scale            # [N]
+# The differentiable train-side forward lives in preprocess.clip_scores so that
+# train.py and the anchor warmups share ONE implementation and cannot drift from
+# eval. Imported under the existing private name to keep all call sites unchanged.
+from functions.attack.preprocess import clip_scores as _clip_scores
 
 
 def _get_clean_probs(
@@ -195,14 +172,19 @@ def _get_clean_probs(
         extract_object_subject_torch,
         crop_image_contain_bboxes_torch,
     )
+    # alpha/white_alpha come from the VINE config so they match eval exactly
+    alpha       = vine_model.config.alpha
+    white_alpha = vine_model.config.white_alpha
     with torch.no_grad():
         if is_pair:
-            proc = extract_object_subject_torch(frame.to(device), mask.to(device), obj_mask.to(device))
-            crop = crop_image_contain_bboxes_torch(proc, [bbox, obj_bbox])
+            # relation head: eval crops to the union of subject+object bboxes
+            proc    = extract_object_subject_torch(frame.to(device), mask.to(device), obj_mask.to(device),
+                                                   alpha=alpha, white_alpha=white_alpha)
+            clip_in = crop_image_contain_bboxes_torch(proc, [bbox, obj_bbox])
         else:
-            proc = extract_single_object_torch(frame.to(device), mask.to(device))
-            crop = crop_image_contain_bboxes_torch(proc, [bbox])
-        scores = _clip_scores(vine_model, clip_encoder, crop, keywords, device, clip_image_size)
+            # category/attribute head: eval uses the FULL frame, not a bbox crop
+            clip_in = extract_single_object_torch(frame.to(device), mask.to(device), alpha=alpha)
+        scores = _clip_scores(vine_model, clip_encoder, clip_in, keywords, device, clip_image_size)
         return torch.softmax(scores, dim=-1)
 
 
@@ -229,7 +211,7 @@ def train_patch(
     """
     from functions.attack.data import EscaAttackDataset
     from functions.attack.patch import AdversarialPatch, paste_patch, compute_patch_size
-    from functions.attack.anchor import select_anchor, select_relation_anchor
+    from functions.attack.anchor import select_anchor, select_relation_anchor, anchor_center
     from functions.attack.reference_gram import (
         compute_reference_grams, build_vgg_normalisation_tensors
     )
@@ -275,7 +257,15 @@ def train_patch(
 
     if len(instances) == 0:
         raise RuntimeError(f"No instances found for '{config.target_category}'.")
-    print(f"Found {len(instances)} instances.")
+    print(f"Found {len(instances)} instances. Filtering by clean VINE prediction...")
+    instances = _filter_by_clean_prediction(instances, vine_model, config, device)
+    if len(instances) == 0:
+        raise RuntimeError(
+            f"No instances remain after clean-prediction filter — VINE does not predict "
+            f"'{config.target_attribute or config.target_category or config.target_relation}' "
+            f"on any training frame."
+        )
+    print(f"  → {len(instances)} instances kept.")
 
     # ── Phase 0a: SAM anchor selection ───────────────────────────────────────
     print("\n=== Phase 0a: SAM anchor selection ===")
@@ -349,25 +339,6 @@ def train_patch(
 
     os.makedirs(config.output_dir, exist_ok=True)
 
-    # ── Identify label indices for attack and preservation ───────────────────
-    sample_spec = instances[0]['gpt_spec']
-    cat_kws    = sample_spec.get('consts',       [])
-    unary_kws  = sample_spec.get('unary_kws',    [])
-    binary_kws = sample_spec.get('binary_kws',   [])
-
-    if config.attack_mode == 'category':
-        correct_idx = next(
-            (i for i, c in enumerate(cat_kws) if config.target_category.lower() in c.lower()), 0
-        )
-    elif config.attack_mode == 'attribute':
-        correct_idx = next(
-            (i for i, c in enumerate(unary_kws) if config.target_attribute.lower() in c.lower()), 0
-        )
-    else:
-        correct_idx = next(
-            (i for i, k in enumerate(binary_kws) if config.target_relation.lower() in k.lower()), 0
-        )
-
     # ── Main training loop ────────────────────────────────────────────────────
     print(f"\n=== Training patch ({config.num_steps} steps) ===")
 
@@ -384,6 +355,12 @@ def train_patch(
         step_preserve = torch.tensor(0.0, device=device)
 
         for inst in batch:
+            # Per-instance vocabulary: each clip has its own keyword list
+            inst_spec       = inst['gpt_spec']
+            inst_cat_kws    = inst_spec.get('consts',     [])
+            inst_unary_kws  = inst_spec.get('unary_kws',  [])
+            inst_binary_kws = inst_spec.get('binary_kws', [])
+
             if config.attack_mode == 'relation':
                 frame     = inst['frame'].to(device)
                 subj_mask = inst['subj_mask'].to(device)
@@ -391,32 +368,45 @@ def train_patch(
                 subj_bbox = inst['subj_bbox']
                 obj_bbox  = inst['obj_bbox']
 
+                binary_kws  = inst_binary_kws
+                correct_idx = next(
+                    (i for i, k in enumerate(binary_kws)
+                     if config.target_relation.lower() in k.lower()), None
+                )
+                if correct_idx is None:
+                    continue
+
                 ph, pw    = compute_patch_size(subj_bbox, config.coverage_ratio)
+                cx, cy    = anchor_center(anchor, subj_bbox)
                 patched   = paste_patch(
                     frame, patch.pixels_hwc,
-                    anchor.cx, anchor.cy, ph, pw,
+                    cx, cy, ph, pw,
                     offset_range=config.offset_range,
                 )
 
-                proc  = extract_object_subject_torch(patched, subj_mask, obj_mask)
+                # Relation head: eval extracts subject+object (red/blue channel boost)
+                # then crops to the union of both bboxes. Mirror that exactly.
+                proc  = extract_object_subject_torch(
+                    patched, subj_mask, obj_mask,
+                    alpha=vine_model.config.alpha, white_alpha=vine_model.config.white_alpha,
+                )
                 crop  = crop_image_contain_bboxes_torch(proc, [subj_bbox, obj_bbox])
                 scores = _clip_scores(
                     vine_model, vine_model.clip_binary_model,
                     crop, binary_kws, device, config.clip_image_size,
                 )
-                probs_attacked = torch.softmax(scores, dim=-1)
                 step_attack = step_attack + l_attack_cw(scores, correct_idx, config.kappa)
 
-                # Preservation: category and attribute heads
-                for (enc, kws, is_pair) in [
-                    (vine_model.clip_cate_model,   cat_kws,   False),
-                    (vine_model.clip_unary_model,  unary_kws, False),
+                # Preservation: category and attribute heads of the subject — these
+                # are classified on the FULL frame in eval (no crop).
+                for enc, kws in [
+                    (vine_model.clip_cate_model,  inst_cat_kws),
+                    (vine_model.clip_unary_model, inst_unary_kws),
                 ]:
                     if not kws:
                         continue
-                    proc_p = extract_single_object_torch(patched, subj_mask)
-                    crop_p = crop_image_contain_bboxes_torch(proc_p, [subj_bbox])
-                    s_pat  = _clip_scores(vine_model, enc, crop_p, kws, device, config.clip_image_size)
+                    proc_p = extract_single_object_torch(patched, subj_mask, alpha=vine_model.config.alpha)
+                    s_pat  = _clip_scores(vine_model, enc, proc_p, kws, device, config.clip_image_size)
                     p_pat  = torch.softmax(s_pat, dim=-1)
                     p_orig = _get_clean_probs(vine_model, enc, inst['frame'], inst['subj_mask'],
                                               subj_bbox, kws, device, config.clip_image_size)
@@ -427,33 +417,47 @@ def train_patch(
                 mask  = inst['mask'].to(device)
                 bbox  = inst['bbox']
 
+                if config.attack_mode == 'category':
+                    enc         = vine_model.clip_cate_model
+                    kws         = inst_cat_kws
+                    target_str  = config.target_category
+                else:
+                    enc         = vine_model.clip_unary_model
+                    kws         = inst_unary_kws
+                    target_str  = config.target_attribute
+
+                correct_idx = next(
+                    (i for i, c in enumerate(kws) if target_str.lower() in c.lower()), None
+                )
+                if correct_idx is None:
+                    continue
+
                 ph, pw  = compute_patch_size(bbox, config.coverage_ratio)
+                cx, cy  = anchor_center(anchor, bbox)
                 patched = paste_patch(
                     frame, patch.pixels_hwc,
-                    anchor.cx, anchor.cy, ph, pw,
+                    cx, cy, ph, pw,
                     offset_range=config.offset_range,
                 )
 
-                proc  = extract_single_object_torch(patched, mask)
-                crop  = crop_image_contain_bboxes_torch(proc, [bbox])
+                # Category/attribute heads: eval classifies on the FULL frame with
+                # background whitened (no bbox crop). Mirror that here so the patch
+                # is optimised against the same input it is scored on.
+                proc = extract_single_object_torch(patched, mask, alpha=vine_model.config.alpha)
 
-                enc = (vine_model.clip_cate_model if config.attack_mode == 'category'
-                       else vine_model.clip_unary_model)
-                kws = cat_kws if config.attack_mode == 'category' else unary_kws
-
-                scores = _clip_scores(vine_model, enc, crop, kws, device, config.clip_image_size)
+                scores = _clip_scores(vine_model, enc, proc, kws, device, config.clip_image_size)
                 step_attack = step_attack + l_attack_cw(scores, correct_idx, config.kappa)
 
-                # Preservation: the other two heads
+                # Preservation: the other two heads (same full-frame input)
                 preserve_heads = [
-                    (vine_model.clip_cate_model,  cat_kws)    if config.attack_mode == 'attribute' else
-                    (vine_model.clip_unary_model, unary_kws),
-                    (vine_model.clip_binary_model, binary_kws),
+                    (vine_model.clip_cate_model,   inst_cat_kws)   if config.attack_mode == 'attribute'
+                    else (vine_model.clip_unary_model, inst_unary_kws),
+                    (vine_model.clip_binary_model, inst_binary_kws),
                 ]
-                for (penc, pkws) in preserve_heads:
+                for penc, pkws in preserve_heads:
                     if not pkws:
                         continue
-                    s_pat  = _clip_scores(vine_model, penc, crop, pkws, device, config.clip_image_size)
+                    s_pat  = _clip_scores(vine_model, penc, proc, pkws, device, config.clip_image_size)
                     p_pat  = torch.softmax(s_pat, dim=-1)
                     p_orig = _get_clean_probs(vine_model, penc, inst['frame'], inst['mask'],
                                               bbox, pkws, device, config.clip_image_size)
@@ -464,7 +468,7 @@ def train_patch(
             step_gram   = step_gram   + l_chameleon_gram(patch_px, reference_grams, vgg, vgg_mean, vgg_std)
             step_tv     = step_tv     + l_chameleon_tv(patch_px)
             step_dino_l = step_dino_l + l_chameleon_dino(
-                patched, _patch_bbox_from_anchor(anchor, ph, pw, patched.shape),
+                patched, _patch_bbox_from_anchor(cx, cy, ph, pw, patched.shape),
                 dino_model, dino_preprocess_torch,
             )
 
@@ -497,7 +501,7 @@ def train_patch(
         if (step + 1) % config.save_every == 0:
             ckpt_base = os.path.join(
                 config.output_dir,
-                f"{config.attack_mode}_{config.target_category}_step{step+1}",
+                f"{_attack_slug(config)}_step{step+1}",
             )
             torch.save({
                 'step':   step + 1,
@@ -510,12 +514,106 @@ def train_patch(
 
     final_base = os.path.join(
         config.output_dir,
-        f"{config.attack_mode}_{config.target_category}_final",
+        f"{_attack_slug(config)}_final",
     )
     torch.save({'w': patch.w.data, 'anchor': anchor, 'config': config}, final_base + '.pt')
     _save_patch_png(patch, final_base)
     print(f"\nFinal patch saved: {final_base}.pt + .png")
     return patch
+
+
+def _bbox_center(bbox: dict):
+    return (bbox['x1'] + bbox['x2']) // 2, (bbox['y1'] + bbox['y2']) // 2
+
+
+def _filter_by_clean_prediction(
+    instances: list,
+    vine_model,
+    config: 'AttackConfig',
+    device: torch.device,
+) -> list:
+    """
+    Keep only instances where VINE's top-1 clean prediction matches the target.
+
+    - category attack: predicted category contains target_category
+    - attribute attack: predicted attribute contains target_attribute
+    - relation attack: predicted relation contains target_relation
+
+    This ensures the attack has something to flip — training on instances
+    where the model already predicts the wrong label is wasted signal.
+    """
+    from functions.attack.preprocess import (
+        extract_single_object_torch,
+        extract_object_subject_torch,
+        crop_image_contain_bboxes_torch,
+    )
+
+    kept = []
+    for inst in instances:
+        frame = inst['frame'].to(device)
+        spec  = inst['gpt_spec']
+
+        try:
+            if config.attack_mode in ('category', 'attribute'):
+                mask = inst['mask'].to(device)
+
+                # Must mirror eval: category/attribute classify on the full frame
+                proc = extract_single_object_torch(frame, mask, alpha=vine_model.config.alpha)
+
+                if config.attack_mode == 'category':
+                    enc    = vine_model.clip_cate_model
+                    kws    = spec.get('consts', [])
+                    target = config.target_category
+                else:
+                    enc    = vine_model.clip_unary_model
+                    kws    = spec.get('unary_kws', [])
+                    target = config.target_attribute
+
+                if not kws:
+                    continue
+
+                with torch.no_grad():
+                    scores  = _clip_scores(vine_model, enc, proc, kws, device, config.clip_image_size)
+                    top1_lbl = kws[scores.argmax().item()]
+
+            else:  # relation
+                subj_mask = inst['subj_mask'].to(device)
+                obj_mask  = inst['obj_mask'].to(device)
+                subj_bbox = inst['subj_bbox']
+                obj_bbox  = inst['obj_bbox']
+                kws       = spec.get('binary_kws', [])
+                target    = config.target_relation
+
+                if not kws:
+                    continue
+
+                proc = extract_object_subject_torch(
+                    frame, subj_mask, obj_mask,
+                    alpha=vine_model.config.alpha, white_alpha=vine_model.config.white_alpha,
+                )
+                crop = crop_image_contain_bboxes_torch(proc, [subj_bbox, obj_bbox])
+
+                with torch.no_grad():
+                    scores  = _clip_scores(vine_model, vine_model.clip_binary_model,
+                                           crop, kws, device, config.clip_image_size)
+                    top1_lbl = kws[scores.argmax().item()]
+
+            if target.lower() in top1_lbl.lower():
+                kept.append(inst)
+
+        except Exception:
+            continue
+
+    return kept
+
+
+def _attack_slug(config: AttackConfig) -> str:
+    """Build a filename slug that matches the output subdirectory name."""
+    if config.attack_mode == 'relation' and config.target_relation:
+        return f"relation_{config.target_relation.replace(' ', '_')}_{config.target_category.replace(' ', '_')}"
+    if config.attack_mode == 'attribute' and config.target_attribute:
+        return f"attribute_{config.target_category.replace(' ', '_')}_{config.target_attribute.replace(' ', '_')}"
+    return f"{config.attack_mode}_{config.target_category.replace(' ', '_')}"
 
 
 def _save_patch_png(patch, base_path: str, upscale: int = 8) -> None:
@@ -550,11 +648,11 @@ def _save_patch_png(patch, base_path: str, upscale: int = 8) -> None:
     img_preview.save(base_path + '_preview.png', format='PNG')
 
 
-def _patch_bbox_from_anchor(anchor, patch_h: int, patch_w: int, frame_shape) -> dict:
-    """Compute the actual bbox occupied by the patch given anchor and frame shape."""
+def _patch_bbox_from_anchor(cx: int, cy: int, patch_h: int, patch_w: int, frame_shape) -> dict:
+    """Compute the actual bbox occupied by the patch given absolute center and frame shape."""
     H, W = frame_shape[:2]
-    x1 = max(0, min(anchor.cx - patch_w // 2, W - 1))
-    y1 = max(0, min(anchor.cy - patch_h // 2, H - 1))
+    x1 = max(0, min(cx - patch_w // 2, W - 1))
+    y1 = max(0, min(cy - patch_h // 2, H - 1))
     x2 = max(x1 + 1, min(x1 + patch_w, W))
     y2 = max(y1 + 1, min(y1 + patch_h, H))
     return {'x1': x1, 'y1': y1, 'x2': x2, 'y2': y2}

@@ -32,7 +32,11 @@ def l_attack_cw(
     # Best score among all wrong labels
     mask = torch.ones_like(scores, dtype=torch.bool)
     mask[correct_idx] = False
-    best_wrong = scores[mask].max()
+    wrong_scores = scores[mask]
+    if wrong_scores.numel() == 0:
+        # Only one class in vocabulary — nothing to flip to; no gradient signal
+        return torch.zeros((), device=scores.device, dtype=scores.dtype)
+    best_wrong = wrong_scores.max()
 
     return F.relu(correct_score - best_wrong + kappa)
 
@@ -218,7 +222,37 @@ def total_loss(
     lambda_p: float = 0.5,
 ) -> torch.Tensor:
     """
-    L_total = L_attack + λ_c*(L_gram + λ_tv*L_tv + λ_dino*L_dino) + λ_p*L_preserve
+    Objective minimised over the patch pixels w only (VINE is frozen), averaged
+    over an EoT mini-batch of diversity-sampled target instances with a random
+    paste offset:
+
+        L_total = L_attack
+                + λ_c · ( L_gram + λ_tv · L_tv + λ_dino · L_dino )    [= L_chameleon]
+                + λ_p · L_preserve
+
+    Term by term (all evaluated on the patched target object):
+
+      L_attack   — CW untargeted margin (l_attack_cw) on the ATTACKED head's CLIP
+                   logits over that clip's keyword vocabulary. correct_idx is the
+                   TARGET label we want to suppress; the loss = ReLU(s_target −
+                   max_{j≠target} s_j + κ). It pushes the target label below the
+                   best competitor by margin κ and is 0 once already flipped.
+                   Attacked head: category→clip_cate_model/`consts`,
+                   attribute→clip_unary_model/`unary_kws`,
+                   relation→clip_binary_model/`binary_kws`.
+
+      L_preserve — Σ KL(P_clean ‖ P_patched) over the NON-attacked heads of the
+                   same object. Keeps the other scene-graph predictions unchanged,
+                   giving a surgical (isolated) attack rather than global damage.
+
+      L_chameleon — naturalness regulariser on the patch so it reads as a benign
+                   object rather than noise:
+                     L_gram  : VGG16 Gram-matrix style distance to real object crops,
+                     L_tv    : total variation (spatial smoothness),
+                     L_dino  : DINOv2 CLS-token distance between the patch region and
+                               the full frame (semantic blending into the scene).
+
+    Defaults: λ_c=1.0, λ_tv=1e-4, λ_dino=0.5, λ_p=0.5, κ=0 (flip the top-1 label).
     """
     chameleon = gram_loss + lambda_tv * tv_loss + lambda_dino * dino_loss
     return attack_loss + lambda_c * chameleon + lambda_p * preserve_loss
