@@ -177,6 +177,16 @@ def main():
         download_prerequisites()
     else:
         print("Prerequisites found.")
+
+        # LASER source may be absent if the dataset was migrated from another
+        # machine (sentinels transferred but src/ was not). Run the model step
+        # unconditionally — it is idempotent (skips if already present).
+        laser_dir = Path(__file__).resolve().parent / "src" / "LASER"
+        if not laser_dir.exists():
+            print("\n=== LASER source not found — running model setup ===")
+            from functions.download_model import main as download_model
+            download_model()
+
         print("\n=== Dataset stats ===")
         _show_dataset_stats()
         print("\nTo download more videos run:  python NSAP.py --download-more --category person --attribute standing")

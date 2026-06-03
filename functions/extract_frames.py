@@ -65,7 +65,7 @@ def main(target_fps: float = TARGET_FPS) -> None:
     videos = _find_videos()
     if not videos:
         print(f"No video files found in {VIDEOS_DIR}. Run download_videos.py first.")
-        sys.exit(1)
+        return
 
     print(f"Found {len(videos)} videos. Extracting frames at {target_fps} FPS → {FRAMES_DIR}")
     FRAMES_DIR.mkdir(parents=True, exist_ok=True)

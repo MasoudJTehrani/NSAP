@@ -93,7 +93,8 @@ def compute_reference_grams(
 
     with torch.no_grad():
         for i, inst in enumerate(samples):
-            frame = inst['frame'].to(device)
+            from functions.attack.data import load_frame as _load_frame
+            frame = _load_frame(inst).to(device)
             mask  = inst['mask'].to(device)
             bbox  = inst['bbox']
 

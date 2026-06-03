@@ -163,6 +163,13 @@ def save_sample_images(
                     if target_attribute.lower() in (sg_clean.attributes.get(oid) or '').lower()
                 }
 
+            # Targeting policy: visualize only the largest target object per clip
+            # (masks are over-segmented; ignore fragments). Matches training/eval.
+            if target_category:
+                from functions.attack.data import largest_object_id
+                _best = largest_object_id(masks, target_obj_ids)
+                target_obj_ids = {_best} if _best is not None else set()
+
             attacked_head = 'category' if mode == 'category' else 'attribute'
             clean_preds   = sg_clean.categories if mode == 'category' else sg_clean.attributes
 
@@ -181,7 +188,7 @@ def save_sample_images(
 
                 bbox   = bboxes[frame_id][obj_id]
                 ph, pw = compute_patch_size(bbox, config.coverage_ratio)
-                cx, cy = anchor_center(anchor, bbox)
+                cx, cy = anchor_center(anchor, bbox, ph, pw)
 
                 # Patch ONLY this target object for the visualisation frame
                 patched_frame = paste_patch(
@@ -239,7 +246,7 @@ def save_sample_images(
 
                 subj_bbox = bboxes[frame_id][subj_id]
                 ph, pw    = compute_patch_size(subj_bbox, config.coverage_ratio)
-                cx, cy    = anchor_center(anchor, subj_bbox)
+                cx, cy    = anchor_center(anchor, subj_bbox, ph, pw)
 
                 # Patch ONLY the subject object for this visualisation frame
                 patched_frame = paste_patch(

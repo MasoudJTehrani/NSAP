@@ -45,7 +45,7 @@ def _patch_object_across_frames(
         if obj_id in frame_bboxes:
             bbox   = frame_bboxes[obj_id]
             ph, pw = compute_patch_size(bbox, config.coverage_ratio)
-            cx, cy = anchor_center(anchor, bbox)
+            cx, cy = anchor_center(anchor, bbox, ph, pw)
             f = paste_patch(
                 frame.clone().to(device), patch.pixels_hwc, cx, cy, ph, pw,
             ).cpu()
@@ -196,6 +196,13 @@ def compute_flip_rate_across_clips(
                     oid for oid in target_obj_ids
                     if config.target_attribute.lower() in (sg_clean.attributes.get(oid) or '').lower()
                 }
+
+            # Targeting policy: attack only the largest target object per clip
+            # (masks are over-segmented; ignore fragments). Matches training.
+            if config.target_category:
+                from functions.attack.data import largest_object_id
+                best = largest_object_id(masks, target_obj_ids)
+                target_obj_ids = {best} if best is not None else set()
 
             clean_preds = (sg_clean.categories if config.attack_mode == 'category'
                            else sg_clean.attributes)

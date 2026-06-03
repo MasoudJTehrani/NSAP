@@ -4,11 +4,53 @@ import pickle
 import math
 import torch
 from fractions import Fraction
+from functools import lru_cache
 from torch.utils.data import Dataset
 from typing import List, Dict, Optional, Tuple, Set
 import numpy as np
 
-from laser.loading import load_video
+import cv2 as _cv2
+
+
+def load_video(video_path, target_fps=None):
+    if not os.path.exists(video_path):
+        print("video path does not exist")
+        return []
+    cap = _cv2.VideoCapture(video_path)
+    sample_rate = 1
+    if target_fps is not None:
+        original_fps = cap.get(_cv2.CAP_PROP_FPS)
+        if target_fps > original_fps:
+            raise ValueError("Target FPS cannot be higher than original FPS.")
+        sample_rate = int(original_fps / target_fps)
+    frames = []
+    i = 0
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret:
+            break
+        if i % sample_rate == 0:
+            frames.append(_cv2.cvtColor(frame, _cv2.COLOR_BGR2RGB))
+        i += 1
+    cap.release()
+    return frames
+
+
+@lru_cache(maxsize=8)
+def _cached_frames(video_path: str, target_fps: int, max_vid_len: int):
+    """Load and subsample a video; cache the last 8 clips to avoid re-reading disk."""
+    raw = load_video(video_path, target_fps if target_fps > 0 else None)
+    if len(raw) > max_vid_len:
+        rate = math.ceil(len(raw) / max_vid_len)
+        raw = [f for i, f in enumerate(raw) if i % rate == 0]
+    return raw  # list of HxWx3 uint8 numpy arrays (RGB)
+
+
+def load_frame(inst: dict) -> torch.Tensor:
+    """Lazy-load the frame for an instance as a float32 RGB tensor [H,W,3]."""
+    frames = _cached_frames(inst['_video_path'], inst['_target_fps'], inst['_max_vid_len'])
+    idx = min(inst['_frame_idx'], len(frames) - 1)
+    return torch.from_numpy(frames[idx].astype(np.float32))
 
 
 def _parse_frac_range(s: str) -> Tuple[float, float]:
@@ -108,6 +150,70 @@ def _bboxes_from_masks(masks: Dict[int, Dict[int, torch.Tensor]]) -> Dict[int, D
     return bboxes
 
 
+def _resize_masks_to_frames(
+    masks: Dict[int, Dict[int, torch.Tensor]],
+    frames: List[torch.Tensor],
+) -> Dict[int, Dict[int, torch.Tensor]]:
+    """
+    Resize every per-object mask to its frame's (H, W).
+
+    Mask files ship at arbitrary resolutions (e.g. 640x360, often portrait) that
+    rarely match the re-downloaded video. Bboxes are derived from masks, and the
+    patch is placed using those bboxes, so masks MUST live in the same coordinate
+    space as the decoded frames. Resizing here (once, early) makes masks, bboxes,
+    patch placement and visualization all share the frame coordinate system.
+
+    Uses nearest-neighbour to preserve the binary mask, matching the resize that
+    the eval scene-graph path (functions/eval/scene_graph.py) applied downstream.
+    """
+    import torch.nn.functional as F
+
+    resized: Dict[int, Dict[int, torch.Tensor]] = {}
+    for frame_id, obj_masks in masks.items():
+        if frame_id >= len(frames):
+            continue
+        H, W = int(frames[frame_id].shape[0]), int(frames[frame_id].shape[1])
+        resized[frame_id] = {}
+        for obj_id, m in obj_masks.items():
+            if m.shape[0] != H or m.shape[1] != W:
+                m = F.interpolate(
+                    m.float().unsqueeze(0).unsqueeze(0),
+                    size=(H, W), mode='nearest',
+                ).squeeze(0).squeeze(0).bool()
+            resized[frame_id][obj_id] = m
+    return resized
+
+
+def object_areas(masks: Dict[int, Dict[int, torch.Tensor]]) -> Dict[int, int]:
+    """Max mask area (pixel count) per obj_id across all frames of a clip."""
+    areas: Dict[int, int] = {}
+    for obj_masks in masks.values():
+        for obj_id, m in obj_masks.items():
+            a = int(m.sum().item())
+            if a > areas.get(obj_id, 0):
+                areas[obj_id] = a
+    return areas
+
+
+def largest_object_id(masks: Dict[int, Dict[int, torch.Tensor]], candidates) -> Optional[int]:
+    """
+    Return the candidate obj_id with the largest mask area, or None.
+
+    The mask set is heavily over-segmented (SAM2/GroundingDINO emit dozens of
+    objects per clip, many of them noise specks). There is no ground-truth
+    obj_id->category map, so the target is chosen as the largest-area object among
+    those VINE classifies as the target category — i.e. the actual subject, not a
+    fragment. Used by both training and eval so they pick the SAME object.
+    """
+    areas = object_areas(masks)
+    best, best_area = None, 0
+    for obj_id in candidates:
+        a = areas.get(obj_id, 0)
+        if a > best_area:
+            best, best_area = obj_id, a
+    return best
+
+
 class EscaAttackDataset(Dataset):
     """
     Loads ESCA video clips and their per-object masks for adversarial patch training.
@@ -140,10 +246,12 @@ class EscaAttackDataset(Dataset):
         split: Optional[str] = None,
         target_fps: int = 1,
         max_vid_len: int = 10,
+        max_clips: int = 0,
     ):
         self.dataset_dir = dataset_dir
         self.target_fps = target_fps
         self.max_vid_len = max_vid_len
+        self.max_clips = max_clips
 
         videos_dir = os.path.join(dataset_dir, "videos")
         masks_root = os.path.join(dataset_dir, "mini_LLaVA_10000_masks")
@@ -224,6 +332,12 @@ class EscaAttackDataset(Dataset):
             print(f"  Split '{split}': {len(self.records)} / {len(selected_stems)} clips "
                   f"on disk ({len(all_stems)} mask-covered total)")
 
+        # Cap clips to bound CPU RAM (each clip's masks are ~tens of MB; tens of
+        # thousands of per-instance masks otherwise exhaust RAM). 0 = no cap.
+        if max_clips and len(self.records) > max_clips:
+            self.records = self.records[:max_clips]
+            print(f"  Capped to first {max_clips} clips (--max-clips).")
+
     def __len__(self) -> int:
         return len(self.records)
 
@@ -276,6 +390,10 @@ class EscaAttackDataset(Dataset):
 
         frames = [torch.from_numpy(f.astype(np.float32)) for f in raw_frames]
         masks  = _mask_pkl_to_tensors(raw_masks)
+        # Put masks in the frame coordinate system BEFORE deriving bboxes, so the
+        # bbox (and therefore patch placement + visualization) matches the decoded
+        # frame rather than the mask file's native resolution.
+        masks  = _resize_masks_to_frames(masks, frames)
         bboxes = _bboxes_from_masks(masks)
 
         return {
@@ -324,7 +442,8 @@ class EscaAttackDataset(Dataset):
                 if target_predicate else set(range(n_frames))
             )
 
-            for frame_id, frame in enumerate(item['frames']):
+            video_path = self.records[idx]['video_path']
+            for frame_id in range(n_frames):
                 if frame_id not in relevant:
                     continue
                 frame_masks  = item['masks'].get(frame_id, {})
@@ -333,14 +452,18 @@ class EscaAttackDataset(Dataset):
                     if obj_id not in frame_bboxes:
                         continue
                     instances.append({
-                        'data_id':  item['data_id'],
-                        'frame_id': frame_id,
-                        'obj_id':   obj_id,
-                        'frame':    frame,
-                        'mask':     mask,
-                        'bbox':     frame_bboxes[obj_id],
-                        'gpt_spec': item['gpt_spec'],
+                        'data_id':      item['data_id'],
+                        'frame_id':     frame_id,
+                        'obj_id':       obj_id,
+                        '_video_path':  video_path,
+                        '_frame_idx':   frame_id,
+                        '_target_fps':  self.target_fps,
+                        '_max_vid_len': self.max_vid_len,
+                        'mask':         mask,
+                        'bbox':         frame_bboxes[obj_id],
+                        'gpt_spec':     item['gpt_spec'],
                     })
+            # item['frames'] goes out of scope here — tensors freed immediately
         return instances
 
     def build_relation_instance_list(
@@ -379,7 +502,8 @@ class EscaAttackDataset(Dataset):
             n_frames = len(item['frames'])
             relevant = _relevant_frame_ids(item['gpt_spec'], n_frames, target_relation)
 
-            for frame_id, frame in enumerate(item['frames']):
+            video_path = self.records[idx]['video_path']
+            for frame_id in range(n_frames):
                 if frame_id not in relevant:
                     continue
                 frame_masks  = item['masks'].get(frame_id, {})
@@ -393,17 +517,21 @@ class EscaAttackDataset(Dataset):
                         if subj_id not in frame_bboxes or obj_id not in frame_bboxes:
                             continue
                         instances.append({
-                            'data_id':     item['data_id'],
-                            'frame_id':    frame_id,
-                            'subj_obj_id': subj_id,
-                            'obj_obj_id':  obj_id,
-                            'frame':       frame,
-                            'subj_mask':   frame_masks[subj_id],
-                            'obj_mask':    frame_masks[obj_id],
-                            'subj_bbox':   frame_bboxes[subj_id],
-                            'obj_bbox':    frame_bboxes[obj_id],
-                            'gpt_spec':    item['gpt_spec'],
+                            'data_id':      item['data_id'],
+                            'frame_id':     frame_id,
+                            'subj_obj_id':  subj_id,
+                            'obj_obj_id':   obj_id,
+                            '_video_path':  video_path,
+                            '_frame_idx':   frame_id,
+                            '_target_fps':  self.target_fps,
+                            '_max_vid_len': self.max_vid_len,
+                            'subj_mask':    frame_masks[subj_id],
+                            'obj_mask':     frame_masks[obj_id],
+                            'subj_bbox':    frame_bboxes[subj_id],
+                            'obj_bbox':     frame_bboxes[obj_id],
+                            'gpt_spec':     item['gpt_spec'],
                         })
+            # item['frames'] goes out of scope here — tensors freed immediately
         return instances
 
 

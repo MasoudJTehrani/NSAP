@@ -45,7 +45,7 @@ def _patch_object_across_frames(
         if obj_id in frame_bboxes:
             bbox   = frame_bboxes[obj_id]
             ph, pw = compute_patch_size(bbox, config.coverage_ratio)
-            cx, cy = anchor_center(anchor, bbox)
+            cx, cy = anchor_center(anchor, bbox, ph, pw)
             f = paste_patch(
                 frame.clone().to(device), patch.pixels_hwc, cx, cy, ph, pw,
             ).cpu()

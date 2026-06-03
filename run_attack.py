@@ -129,6 +129,8 @@ def run_train(args):
         output_dir       = attack_dir,
         ref_gram_cache   = os.path.join(args.output_dir, "gram_cache"),
         clip_image_size  = args.clip_size,
+        use_chameleon    = args.use_chameleon,
+        max_clips        = args.max_clips,
     )
 
     device     = args.device
@@ -196,6 +198,11 @@ def run_eval(args):
     config: AttackConfig = ckpt['config']
     anchor: Anchor       = ckpt['anchor']
 
+    # Eval materializes every test clip's frames + masks at once, so allow the
+    # CLI --max-clips to override the (larger) cap baked into the checkpoint.
+    if getattr(args, 'max_clips', 0):
+        config.max_clips = args.max_clips
+
     _ensure_videos(
         config.attack_mode,
         config.target_category,
@@ -215,6 +222,7 @@ def run_eval(args):
         target_category  = config.target_category,
         target_attribute = config.target_attribute if config.attack_mode == 'attribute' else None,
         split            = 'test',
+        max_clips        = getattr(config, 'max_clips', 0),
     )
 
     test_items = [dataset[i] for i in range(len(dataset))]
@@ -305,6 +313,12 @@ def main():
     parser.add_argument("--coverage", type=float, default=0.3,   help="Patch coverage ratio")
     parser.add_argument("--clip-size",type=int,   default=224,
                         dest="clip_size", help="CLIP input size (224 or 336)")
+    parser.add_argument("--no-chameleon", action="store_false", dest="use_chameleon",
+                        help="Disable Chameleon naturalness losses (gram/tv/dino). "
+                             "Frees VGG16 + DINOv2 from GPU — use on small-memory cards.")
+    parser.add_argument("--max-clips", type=int, default=0, dest="max_clips",
+                        help="Cap clips loaded into RAM (0 = no cap). Each clip's masks "
+                             "cost ~tens of MB; cap this on machines with limited RAM.")
 
     # Eval
     parser.add_argument("--eval",  action="store_true", help="Run evaluation instead of training")

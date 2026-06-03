@@ -13,6 +13,7 @@ import torch.optim as optim
 import numpy as np
 from typing import List, Tuple, NamedTuple
 import copy
+from functions.attack.data import load_frame as _load_frame
 
 
 class Anchor(NamedTuple):
@@ -70,19 +71,39 @@ def _abs_to_rel(cx: int, cy: int, bbox: dict) -> Tuple[int, int]:
     return cx - bcx, cy - bcy
 
 
-def anchor_center(anchor: 'Anchor', bbox: dict) -> Tuple[int, int]:
+def anchor_center(
+    anchor: 'Anchor',
+    bbox: dict,
+    patch_h: int = None,
+    patch_w: int = None,
+) -> Tuple[int, int]:
     """
     Compute the absolute (cx, cy) paste center for an Anchor on a given bbox.
 
-    Applies the pixel offset and then clamps the result to within the bbox, so
-    the patch always lands on the target object even when the eval bbox is
-    smaller than the training bboxes that produced the anchor offset.
+    Applies the learned pixel offset, then clamps the result so the patch stays
+    on the target object even when the eval bbox is smaller than the training
+    bboxes that produced the offset.
+
+    When patch_h/patch_w are given, the clamp is INSET by half the patch size so
+    the WHOLE patch stays inside the bbox (otherwise a large offset pins the
+    centre to the bbox edge and ~half the patch spills outside). If the patch is
+    larger than the bbox on an axis, that axis falls back to the bbox centre.
+    Without patch_h/patch_w it clamps the centre to the bbox edges (legacy).
     """
+    x1, y1, x2, y2 = int(bbox['x1']), int(bbox['y1']), int(bbox['x2']), int(bbox['y2'])
     bcx, bcy = _bbox_center(bbox)
     cx = bcx + anchor.dx
     cy = bcy + anchor.dy
-    cx = max(int(bbox['x1']), min(int(bbox['x2']), cx))
-    cy = max(int(bbox['y1']), min(int(bbox['y2']), cy))
+
+    if patch_w is not None and patch_h is not None:
+        hw, hh = patch_w // 2, patch_h // 2
+        lo_x, hi_x = x1 + hw, x2 - hw
+        lo_y, hi_y = y1 + hh, y2 - hh
+        cx = (x1 + x2) // 2 if lo_x > hi_x else max(lo_x, min(hi_x, cx))
+        cy = (y1 + y2) // 2 if lo_y > hi_y else max(lo_y, min(hi_y, cy))
+    else:
+        cx = max(x1, min(x2, cx))
+        cy = max(y1, min(y2, cy))
     return cx, cy
 
 
@@ -148,14 +169,14 @@ def _evaluate_anchor(
 
         for inst, inst_kws, inst_correct_idx in cw_eval_instances:
 
-            frame = inst['frame'].to(device)
+            frame = _load_frame(inst).to(device)
             mask  = inst['mask'].to(device)
             bbox  = inst['bbox']
             ph, pw = compute_patch_size(bbox, coverage_ratio)
 
-            bcx, bcy = _bbox_center(bbox)
-            cx = max(int(bbox['x1']), min(int(bbox['x2']), bcx + anchor_dx))
-            cy = max(int(bbox['y1']), min(int(bbox['y2']), bcy + anchor_dy))
+            # Place exactly as paste-time does (inset clamp keeps the whole patch
+            # inside the bbox), so the anchor is selected under the real placement.
+            cx, cy = anchor_center(Anchor(anchor_dx, anchor_dy, ''), bbox, ph, pw)
 
             patched = paste_patch(frame, patch.pixels_hwc, cx, cy, ph, pw)
 
@@ -202,7 +223,7 @@ def select_anchor(
     candidate_votes: dict = {}   # (dx, dy) -> cumulative vote count
 
     for inst in eval_subset[:20]:
-        frame_np = inst['frame'].numpy().astype(np.uint8)
+        frame_np = _load_frame(inst).numpy().astype(np.uint8)
         bbox     = inst['bbox']
         abs_anchors = _get_sam_anchors(frame_np, bbox, sam_predictor)
         for cx, cy in abs_anchors:
@@ -272,7 +293,7 @@ def select_relation_anchor(
 
     candidate_votes: dict = {}
     for inst in eval_subset[:20]:
-        frame_np  = inst['frame'].numpy().astype(np.uint8)
+        frame_np  = _load_frame(inst).numpy().astype(np.uint8)
         subj_bbox = inst['subj_bbox']
         abs_anchors = _get_sam_anchors(frame_np, subj_bbox, sam_predictor)
         for cx, cy in abs_anchors:
@@ -313,16 +334,15 @@ def select_relation_anchor(
             total = torch.tensor(0.0, device=device)
             optimizer.zero_grad()
             for inst in eval_subset[:20]:
-                frame      = inst['frame'].to(device)
+                frame      = _load_frame(inst).to(device)
                 subj_mask  = inst['subj_mask'].to(device)
                 obj_mask   = inst['obj_mask'].to(device)
                 subj_bbox  = inst['subj_bbox']
                 obj_bbox   = inst['obj_bbox']
                 ph, pw     = compute_patch_size(subj_bbox, coverage_ratio)
 
-                bcx, bcy = _bbox_center(subj_bbox)
-                cx = max(int(subj_bbox['x1']), min(int(subj_bbox['x2']), bcx + dx))
-                cy = max(int(subj_bbox['y1']), min(int(subj_bbox['y2']), bcy + dy))
+                # Match paste-time placement (inset clamp) during selection too.
+                cx, cy = anchor_center(Anchor(dx, dy, ''), subj_bbox, ph, pw)
 
                 patched = paste_patch(frame, patch.pixels_hwc, cx, cy, ph, pw)
                 # relation: eval crops to the union of subject+object bboxes

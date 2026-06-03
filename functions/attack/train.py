@@ -58,6 +58,14 @@ class AttackConfig:
     # CLIP image size (224 for ViT-B/32; 336 for ViT-L/14-336)
     clip_image_size: int = 224
 
+    # Chameleon naturalness losses (gram/tv/dino). Disable to free VGG16 + DINOv2
+    # from GPU on small-memory cards. DINOv2 is still used for diversity clustering.
+    use_chameleon: bool = True
+
+    # Cap clips loaded into RAM (0 = no cap). Each clip's per-instance masks cost
+    # ~tens of MB; tens of thousands of them exhaust CPU RAM during dataset build.
+    max_clips: int = 0
+
     # Checkpointing
     save_every: int          = 200
     output_dir: str          = "output/patches"
@@ -91,7 +99,7 @@ def _build_dino_clusters(
     dino_model.eval()
     with torch.no_grad():
         for inst in instances:
-            frame = inst['frame'].to(device)
+            frame = _load_frame(inst).to(device)
             pv    = dino_preprocess_fn(frame)
             out   = dino_model(pixel_values=pv)
             cls   = out.last_hidden_state[:, 0, :].cpu().float()
@@ -148,6 +156,7 @@ def _diversity_sample(
 # train.py and the anchor warmups share ONE implementation and cannot drift from
 # eval. Imported under the existing private name to keep all call sites unchanged.
 from functions.attack.preprocess import clip_scores as _clip_scores
+from functions.attack.data import load_frame as _load_frame
 
 
 def _get_clean_probs(
@@ -243,6 +252,7 @@ def train_patch(
         target_category=config.target_category if config.attack_mode != 'relation' else None,
         target_attribute=config.target_attribute if config.attack_mode == 'attribute' else None,
         split='train',
+        max_clips=config.max_clips,
     )
 
     if config.attack_mode == 'relation':
@@ -266,6 +276,12 @@ def train_patch(
             f"on any training frame."
         )
     print(f"  → {len(instances)} instances kept.")
+
+    # Targeting policy: attack only the LARGEST target object per clip. Masks are
+    # over-segmented (many noise fragments VINE may also label as the target), so
+    # without this the patch is trained against fragments, not the real subject.
+    instances = _keep_largest_target_per_clip(instances, config)
+    print(f"  → {len(instances)} instances after largest-target-per-clip filter.")
 
     # ── Phase 0a: SAM anchor selection ───────────────────────────────────────
     print("\n=== Phase 0a: SAM anchor selection ===")
@@ -294,6 +310,10 @@ def train_patch(
             target_attribute=config.target_attribute,
         )
 
+    # SAM2 is only needed for Phase 0a — free it before loading DINOv2 + VGG
+    del sam_predictor
+    torch.cuda.empty_cache()
+
     # ── Phase 0b: DINO diversity clustering ──────────────────────────────────
     print("\n=== Phase 0b: DINO diversity clustering ===")
     dino_model = AutoModel.from_pretrained(config.dino_model_name)
@@ -309,24 +329,37 @@ def train_patch(
         device=device,
     )
 
-    # ── Precompute reference Gram matrices ────────────────────────────────────
-    print("\n=== Precomputing reference Gram matrices ===")
-    gram_cache = os.path.join(
-        config.ref_gram_cache,
-        f"{config.attack_mode}_{config.target_category}_gram.pt",
-    )
-    reference_grams = compute_reference_grams(
-        instance_list=instances if config.attack_mode != 'relation' else
-                      [{'frame': i['frame'], 'mask': i['subj_mask'], 'bbox': i['subj_bbox']} for i in instances],
-        n_instances=config.ref_gram_n,
-        device=device,
-        cache_path=gram_cache,
-    )
+    # DINOv2 is only needed past this point for the Chameleon dino loss. With
+    # Chameleon off, free it now (clustering is already done).
+    if not config.use_chameleon:
+        del dino_model
+        dino_model = None
+        torch.cuda.empty_cache()
 
-    vgg = tv_models.vgg16(weights=tv_models.VGG16_Weights.IMAGENET1K_V1).eval().to(device)
-    for p in vgg.parameters():
-        p.requires_grad_(False)
-    vgg_mean, vgg_std = build_vgg_normalisation_tensors(device)
+    # ── Precompute reference Gram matrices (Chameleon only) ──────────────────
+    reference_grams = vgg = vgg_mean = vgg_std = None
+    if config.use_chameleon:
+        print("\n=== Precomputing reference Gram matrices ===")
+        gram_cache = os.path.join(
+            config.ref_gram_cache,
+            f"{config.attack_mode}_{config.target_category}_gram.pt",
+        )
+        _lazy_keys = ('_video_path', '_frame_idx', '_target_fps', '_max_vid_len')
+        gram_instances = instances if config.attack_mode != 'relation' else [
+            {**{k: i[k] for k in _lazy_keys}, 'mask': i['subj_mask'], 'bbox': i['subj_bbox']}
+            for i in instances
+        ]
+        reference_grams = compute_reference_grams(
+            instance_list=gram_instances,
+            n_instances=config.ref_gram_n,
+            device=device,
+            cache_path=gram_cache,
+        )
+
+        vgg = tv_models.vgg16(weights=tv_models.VGG16_Weights.IMAGENET1K_V1).eval().to(device)
+        for p in vgg.parameters():
+            p.requires_grad_(False)
+        vgg_mean, vgg_std = build_vgg_normalisation_tensors(device)
 
     # ── Initialise patch and optimizer ───────────────────────────────────────
     sample_bbox = (
@@ -362,7 +395,7 @@ def train_patch(
             inst_binary_kws = inst_spec.get('binary_kws', [])
 
             if config.attack_mode == 'relation':
-                frame     = inst['frame'].to(device)
+                frame     = _load_frame(inst).to(device)
                 subj_mask = inst['subj_mask'].to(device)
                 obj_mask  = inst['obj_mask'].to(device)
                 subj_bbox = inst['subj_bbox']
@@ -377,7 +410,7 @@ def train_patch(
                     continue
 
                 ph, pw    = compute_patch_size(subj_bbox, config.coverage_ratio)
-                cx, cy    = anchor_center(anchor, subj_bbox)
+                cx, cy    = anchor_center(anchor, subj_bbox, ph, pw)
                 patched   = paste_patch(
                     frame, patch.pixels_hwc,
                     cx, cy, ph, pw,
@@ -408,12 +441,12 @@ def train_patch(
                     proc_p = extract_single_object_torch(patched, subj_mask, alpha=vine_model.config.alpha)
                     s_pat  = _clip_scores(vine_model, enc, proc_p, kws, device, config.clip_image_size)
                     p_pat  = torch.softmax(s_pat, dim=-1)
-                    p_orig = _get_clean_probs(vine_model, enc, inst['frame'], inst['subj_mask'],
+                    p_orig = _get_clean_probs(vine_model, enc, _load_frame(inst), inst['subj_mask'],
                                               subj_bbox, kws, device, config.clip_image_size)
                     step_preserve = step_preserve + l_preserve_kl(p_orig, p_pat)
 
             else:
-                frame = inst['frame'].to(device)
+                frame = _load_frame(inst).to(device)
                 mask  = inst['mask'].to(device)
                 bbox  = inst['bbox']
 
@@ -433,7 +466,7 @@ def train_patch(
                     continue
 
                 ph, pw  = compute_patch_size(bbox, config.coverage_ratio)
-                cx, cy  = anchor_center(anchor, bbox)
+                cx, cy  = anchor_center(anchor, bbox, ph, pw)
                 patched = paste_patch(
                     frame, patch.pixels_hwc,
                     cx, cy, ph, pw,
@@ -459,18 +492,19 @@ def train_patch(
                         continue
                     s_pat  = _clip_scores(vine_model, penc, proc, pkws, device, config.clip_image_size)
                     p_pat  = torch.softmax(s_pat, dim=-1)
-                    p_orig = _get_clean_probs(vine_model, penc, inst['frame'], inst['mask'],
+                    p_orig = _get_clean_probs(vine_model, penc, _load_frame(inst), inst['mask'],
                                               bbox, pkws, device, config.clip_image_size)
                     step_preserve = step_preserve + l_preserve_kl(p_orig, p_pat)
 
             # Chameleon losses (computed on the patch directly — not on the crop)
-            patch_px = patch.pixels_hwc  # [H, W, 3]
-            step_gram   = step_gram   + l_chameleon_gram(patch_px, reference_grams, vgg, vgg_mean, vgg_std)
-            step_tv     = step_tv     + l_chameleon_tv(patch_px)
-            step_dino_l = step_dino_l + l_chameleon_dino(
-                patched, _patch_bbox_from_anchor(cx, cy, ph, pw, patched.shape),
-                dino_model, dino_preprocess_torch,
-            )
+            if config.use_chameleon:
+                patch_px = patch.pixels_hwc  # [H, W, 3]
+                step_gram   = step_gram   + l_chameleon_gram(patch_px, reference_grams, vgg, vgg_mean, vgg_std)
+                step_tv     = step_tv     + l_chameleon_tv(patch_px)
+                step_dino_l = step_dino_l + l_chameleon_dino(
+                    patched, _patch_bbox_from_anchor(cx, cy, ph, pw, patched.shape),
+                    dino_model, dino_preprocess_torch,
+                )
 
         n = len(batch)
         loss = total_loss(
@@ -550,7 +584,7 @@ def _filter_by_clean_prediction(
 
     kept = []
     for inst in instances:
-        frame = inst['frame'].to(device)
+        frame = _load_frame(inst).to(device)
         spec  = inst['gpt_spec']
 
         try:
@@ -604,6 +638,42 @@ def _filter_by_clean_prediction(
         except Exception:
             continue
 
+    return kept
+
+
+def _keep_largest_target_per_clip(instances: list, config: 'AttackConfig') -> list:
+    """
+    Keep only the instances belonging to the LARGEST target object in each clip.
+
+    `instances` is already filtered to the target category/predicate by clean VINE
+    prediction. Because the masks are over-segmented (dozens of objects per clip,
+    many noise fragments that VINE may also classify as the target), we pick the
+    single largest-area target object per clip — the actual subject — and drop the
+    rest. All frames of that object are retained for EoT. Mirrors the eval-side
+    `largest_object_id` so training and evaluation attack the SAME object.
+    """
+    from collections import defaultdict
+
+    is_rel   = config.attack_mode == 'relation'
+    id_key   = 'subj_obj_id' if is_rel else 'obj_id'
+    mask_key = 'subj_mask'   if is_rel else 'mask'
+
+    by_clip: dict = defaultdict(list)
+    for inst in instances:
+        by_clip[inst['data_id']].append(inst)
+
+    kept = []
+    for insts in by_clip.values():
+        area: dict = {}
+        for inst in insts:
+            a = int(inst[mask_key].sum().item())
+            oid = inst[id_key]
+            if a > area.get(oid, 0):
+                area[oid] = a
+        if not area:
+            continue
+        best = max(area, key=area.get)
+        kept.extend(inst for inst in insts if inst[id_key] == best)
     return kept
 
 
