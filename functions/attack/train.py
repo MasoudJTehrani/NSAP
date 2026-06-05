@@ -66,6 +66,12 @@ class AttackConfig:
     # ~tens of MB; tens of thousands of them exhaust CPU RAM during dataset build.
     max_clips: int = 0
 
+    # Minimum VINE softmax confidence for the target CATEGORY to accept an object
+    # as a target (0 = off). Drops objects VINE only weakly calls "person" (e.g. a
+    # table misclassified at 0.3), in both training and eval. Applied to the
+    # category head (relation: the subject's category).
+    min_target_conf: float = 0.0
+
     # Checkpointing
     save_every: int          = 200
     output_dir: str          = "output/patches"
@@ -567,14 +573,18 @@ def _filter_by_clean_prediction(
     device: torch.device,
 ) -> list:
     """
-    Keep only instances where VINE's top-1 clean prediction matches the target.
+    Keep only instances where VINE's top-1 clean prediction matches the target,
+    using the SAME gates as eval so training and evaluation target the same objects.
 
-    - category attack: predicted category contains target_category
-    - attribute attack: predicted attribute contains target_attribute
-    - relation attack: predicted relation contains target_relation
+    - category attack:  predicted category contains target_category
+    - attribute attack: predicted category contains target_category AND
+                        predicted attribute contains target_attribute
+    - relation attack:  subject's predicted category contains target_category AND
+                        predicted relation contains target_relation
 
-    This ensures the attack has something to flip — training on instances
-    where the model already predicts the wrong label is wasted signal.
+    The category gate matters: without it, an attribute attack on "stand" keeps any
+    object VINE calls "standing" (e.g. a table), not just standing PERSONS, which
+    both wastes the patch and mismatches eval.
     """
     from functions.attack.preprocess import (
         extract_single_object_torch,
@@ -582,57 +592,70 @@ def _filter_by_clean_prediction(
         crop_image_contain_bboxes_torch,
     )
 
+    def _head_top1_ok(enc, proc_img, kws, target, min_conf: float = 0.0) -> bool:
+        """
+        True if `target` is empty (no gate), or VINE's top-1 over `kws` contains
+        `target` AND its softmax confidence is >= min_conf.
+        """
+        if not target:
+            return True
+        if not kws:
+            return False
+        with torch.no_grad():
+            scores = _clip_scores(vine_model, enc, proc_img, kws, device, config.clip_image_size)
+            probs  = torch.softmax(scores, dim=-1)
+        i = int(probs.argmax().item())
+        if target.lower() not in kws[i].lower():
+            return False
+        return float(probs[i].item()) >= min_conf
+
     kept = []
     for inst in instances:
-        frame = _load_frame(inst).to(device)
-        spec  = inst['gpt_spec']
+        frame  = _load_frame(inst).to(device)
+        spec   = inst['gpt_spec']
+        consts = spec.get('consts', [])
 
         try:
             if config.attack_mode in ('category', 'attribute'):
                 mask = inst['mask'].to(device)
-
-                # Must mirror eval: category/attribute classify on the full frame
+                # category/attribute classify on the full frame (background whitened)
                 proc = extract_single_object_torch(frame, mask, alpha=vine_model.config.alpha)
 
                 if config.attack_mode == 'category':
-                    enc    = vine_model.clip_cate_model
-                    kws    = spec.get('consts', [])
-                    target = config.target_category
+                    ok = _head_top1_ok(vine_model.clip_cate_model, proc, consts,
+                                       config.target_category, min_conf=config.min_target_conf)
                 else:
-                    enc    = vine_model.clip_unary_model
-                    kws    = spec.get('unary_kws', [])
-                    target = config.target_attribute
+                    # attribute: require BOTH the target category (confidently) AND the attribute
+                    ok = (
+                        _head_top1_ok(vine_model.clip_cate_model,  proc, consts,
+                                      config.target_category, min_conf=config.min_target_conf)
+                        and
+                        _head_top1_ok(vine_model.clip_unary_model, proc, spec.get('unary_kws', []),
+                                      config.target_attribute)
+                    )
 
-                if not kws:
-                    continue
-
-                with torch.no_grad():
-                    scores  = _clip_scores(vine_model, enc, proc, kws, device, config.clip_image_size)
-                    top1_lbl = kws[scores.argmax().item()]
-
-            else:  # relation
+            else:  # relation: require subject's category AND the target relation
                 subj_mask = inst['subj_mask'].to(device)
                 obj_mask  = inst['obj_mask'].to(device)
                 subj_bbox = inst['subj_bbox']
                 obj_bbox  = inst['obj_bbox']
-                kws       = spec.get('binary_kws', [])
-                target    = config.target_relation
 
-                if not kws:
+                # subject category gate — full-frame whitened subject, as eval classifies it
+                proc_subj = extract_single_object_torch(frame, subj_mask, alpha=vine_model.config.alpha)
+                if not _head_top1_ok(vine_model.clip_cate_model, proc_subj, consts,
+                                     config.target_category, min_conf=config.min_target_conf):
                     continue
 
+                # relation gate — subject+object crop, as eval classifies the relation
                 proc = extract_object_subject_torch(
                     frame, subj_mask, obj_mask,
                     alpha=vine_model.config.alpha, white_alpha=vine_model.config.white_alpha,
                 )
                 crop = crop_image_contain_bboxes_torch(proc, [subj_bbox, obj_bbox])
+                ok = _head_top1_ok(vine_model.clip_binary_model, crop,
+                                   spec.get('binary_kws', []), config.target_relation)
 
-                with torch.no_grad():
-                    scores  = _clip_scores(vine_model, vine_model.clip_binary_model,
-                                           crop, kws, device, config.clip_image_size)
-                    top1_lbl = kws[scores.argmax().item()]
-
-            if target.lower() in top1_lbl.lower():
+            if ok:
                 kept.append(inst)
 
         except Exception:

@@ -262,6 +262,20 @@ def evaluate_isolation(
                     if config.target_attribute.lower() in (sg_clean.attributes.get(oid) or '').lower()
                 }
 
+            _min_conf = getattr(config, 'min_target_conf', 0.0)
+            if _min_conf > 0:
+                target_obj_ids = {
+                    oid for oid in target_obj_ids
+                    if sg_clean.category_conf.get(oid, 0.0) >= _min_conf
+                }
+
+            # Targeting policy: largest target object per clip (matches flip_rate
+            # and training). Without this, isolation counts fragments too.
+            if config.target_category:
+                from functions.attack.data import largest_object_id
+                best = largest_object_id(masks, target_obj_ids)
+                target_obj_ids = {best} if best is not None else set()
+
             clip_result.n_target_objects = len(target_obj_ids)
 
             for obj_id in target_obj_ids:
@@ -296,6 +310,13 @@ def evaluate_isolation(
                 target_pairs = {
                     p for p in target_pairs
                     if config.target_category.lower() in sg_clean.categories.get(p[0], '').lower()
+                }
+
+            _min_conf = getattr(config, 'min_target_conf', 0.0)
+            if _min_conf > 0:
+                target_pairs = {
+                    p for p in target_pairs
+                    if sg_clean.category_conf.get(p[0], 0.0) >= _min_conf
                 }
 
             target_subj_ids = {pair[0] for pair in target_pairs}
@@ -339,6 +360,29 @@ def evaluate_isolation(
         return {}
 
     n = len(all_edits)
+
+    # Raw totals (pooled across clips) — interpretable counts, not per-clip means.
+    tot_obj     = sum(e.n_target_objects   for e in all_edits)
+    tot_rel     = sum(e.n_target_relations for e in all_edits)
+    tot_cat_ch  = sum(e.category_changes   for e in all_edits)
+    tot_attr_ch = sum(e.attribute_changes  for e in all_edits)
+    tot_rel_ch  = sum(e.relation_changes   for e in all_edits)
+    tot_disp    = sum(e.target_disappeared for e in all_edits)
+    tot_changes = tot_cat_ch + tot_attr_ch + tot_rel_ch + tot_disp
+
+    if config.attack_mode == 'category':
+        attacked_total = tot_cat_ch + tot_disp
+    elif config.attack_mode == 'attribute':
+        attacked_total = tot_attr_ch
+    elif config.attack_mode == 'relation':
+        attacked_total = tot_rel_ch
+    else:
+        attacked_total = 0
+    # Pooled isolation: of ALL changes on target objects, the fraction that hit
+    # the attacked head. Unlike the per-clip mean, no-change clips do NOT count
+    # as 100% — so this reflects focus only over clips where something changed.
+    pooled_isolation = (attacked_total / tot_changes) if tot_changes else 1.0
+
     return {
         'mean_n_target_objects':      sum(e.n_target_objects       for e in all_edits) / n,
         'mean_category_change_rate':  sum(e.category_change_rate   for e in all_edits) / n,
@@ -346,5 +390,16 @@ def evaluate_isolation(
         'mean_relation_change_rate':  sum(e.relation_change_rate   for e in all_edits) / n,
         'mean_disappear_rate':        sum(e.disappear_rate         for e in all_edits) / n,
         'mean_isolation_score':       sum(e.isolation_score(config.attack_mode) for e in all_edits) / n,
-        'per_clip':                   all_edits,
+        # raw counts (pooled)
+        'n_clips':                  n,
+        'n_clips_with_targets':     sum(1 for e in all_edits if e.n_target_objects > 0),
+        'total_target_objects':     tot_obj,
+        'total_target_relations':   tot_rel,
+        'total_category_changes':   tot_cat_ch,
+        'total_attribute_changes':  tot_attr_ch,
+        'total_relation_changes':   tot_rel_ch,
+        'total_disappeared':        tot_disp,
+        'total_changes':            tot_changes,
+        'pooled_isolation_score':   pooled_isolation,
+        'per_clip':                 all_edits,
     }

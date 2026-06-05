@@ -14,6 +14,8 @@ class SceneGraph:
     data_id: str
     # {obj_id: top-1 category string}
     categories: Dict[int, str]          = field(default_factory=dict)
+    # {obj_id: softmax confidence of the top-1 category}
+    category_conf: Dict[int, float]     = field(default_factory=dict)
     # {obj_id: top-1 attribute string}
     attributes: Dict[int, str]          = field(default_factory=dict)
     # {(subj_id, obj_id): top-1 relation string}
@@ -92,11 +94,13 @@ def predict_scene_graph(
     attr_votes: Dict[int, Dict[str, int]] = {}
     rel_votes:  Dict[Tuple[int,int], Dict[str, int]] = {}
 
+    cat_conf: Dict[int, float] = {}
     for obj_id, pred_list in results.get('categorical_predictions', {}).items():
         if pred_list:
-            cat = pred_list[0][1]   # (prob, label) → label
+            prob, cat = pred_list[0][0], pred_list[0][1]   # (prob, label)
             cat_votes.setdefault(obj_id, {})
             cat_votes[obj_id][cat] = cat_votes[obj_id].get(cat, 0) + 1
+            cat_conf[obj_id] = max(cat_conf.get(obj_id, 0.0), float(prob))
 
     for (frame_id, obj_id), pred_list in results.get('unary_predictions', {}).items():
         if pred_list:
@@ -110,8 +114,9 @@ def predict_scene_graph(
             rel_votes.setdefault(obj_pair, {})
             rel_votes[obj_pair][rel] = rel_votes[obj_pair].get(rel, 0) + 1
 
-    sg.categories = {oid: max(votes, key=votes.get) for oid, votes in cat_votes.items()}
-    sg.attributes = {oid: max(votes, key=votes.get) for oid, votes in attr_votes.items()}
-    sg.relations  = {pair: max(votes, key=votes.get) for pair, votes in rel_votes.items()}
+    sg.categories    = {oid: max(votes, key=votes.get) for oid, votes in cat_votes.items()}
+    sg.category_conf = cat_conf
+    sg.attributes    = {oid: max(votes, key=votes.get) for oid, votes in attr_votes.items()}
+    sg.relations     = {pair: max(votes, key=votes.get) for pair, votes in rel_votes.items()}
 
     return sg

@@ -42,6 +42,8 @@ def _draw_sample(
     data_id: str,
     frame_id: int,
     attacked_head: str,
+    obj_category: Optional[str] = None,
+    obj_conf: Optional[float] = None,
 ):
     """
     Draw a single sample image:
@@ -72,7 +74,14 @@ def _draw_sample(
     draw.text((8, 4),  label,   font=f_big,   fill=(255, 255, 255))
     clean_str   = clean_pred   or "—"
     patched_str = patched_pred or "(disappeared)"
-    header_detail = f"{attacked_head}: {clean_str} → {patched_str}   clip={data_id}  frame={frame_id}"
+    # VINE's category call for the target object + its confidence, so a
+    # misclassified target (e.g. a table VINE labels "person" at 0.31) is visible.
+    if obj_category is not None:
+        conf_str = f" {obj_conf:.2f}" if obj_conf is not None else ""
+        cat_tag  = f"[VINE: {obj_category}{conf_str}]  "
+    else:
+        cat_tag = ""
+    header_detail = f"{cat_tag}{attacked_head}: {clean_str} → {patched_str}   clip={data_id}  frame={frame_id}"
     draw.text((8, 26), header_detail, font=f_small, fill=(255, 255, 255))
 
     # Target object bbox (shifted down by BAR)
@@ -163,6 +172,14 @@ def save_sample_images(
                     if target_attribute.lower() in (sg_clean.attributes.get(oid) or '').lower()
                 }
 
+            # Confidence gate (matches training/eval): drop weak-category objects.
+            _min_conf = getattr(config, 'min_target_conf', 0.0)
+            if _min_conf > 0:
+                target_obj_ids = {
+                    oid for oid in target_obj_ids
+                    if sg_clean.category_conf.get(oid, 0.0) >= _min_conf
+                }
+
             # Targeting policy: visualize only the largest target object per clip
             # (masks are over-segmented; ignore fragments). Matches training/eval.
             if target_category:
@@ -217,6 +234,8 @@ def save_sample_images(
                     'data_id':       data_id,
                     'frame_id':      frame_id,
                     'attacked_head': attacked_head,
+                    'obj_category':  sg_clean.categories.get(obj_id),
+                    'obj_conf':      sg_clean.category_conf.get(obj_id),
                 })
 
         elif mode == 'relation':
@@ -270,6 +289,8 @@ def save_sample_images(
                     'data_id':       data_id,
                     'frame_id':      frame_id,
                     'attacked_head': attacked_head,
+                    'obj_category':  sg_clean.categories.get(subj_id),
+                    'obj_conf':      sg_clean.category_conf.get(subj_id),
                 })
 
         # ── Sort into buckets ─────────────────────────────────────────────────
@@ -287,6 +308,7 @@ def save_sample_images(
             worked=True,
             data_id=e['data_id'], frame_id=e['frame_id'],
             attacked_head=e['attacked_head'],
+            obj_category=e.get('obj_category'), obj_conf=e.get('obj_conf'),
         )
         img.save(os.path.join(samples_dir, f"worked_{i:02d}_{e['data_id']}_f{e['frame_id']}.png"))
 
@@ -297,6 +319,7 @@ def save_sample_images(
             worked=False,
             data_id=e['data_id'], frame_id=e['frame_id'],
             attacked_head=e['attacked_head'],
+            obj_category=e.get('obj_category'), obj_conf=e.get('obj_conf'),
         )
         img.save(os.path.join(samples_dir, f"failed_{i:02d}_{e['data_id']}_f{e['frame_id']}.png"))
 

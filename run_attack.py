@@ -131,6 +131,7 @@ def run_train(args):
         clip_image_size  = args.clip_size,
         use_chameleon    = args.use_chameleon,
         max_clips        = args.max_clips,
+        min_target_conf  = args.min_target_conf,
     )
 
     device     = args.device
@@ -202,6 +203,9 @@ def run_eval(args):
     # CLI --max-clips to override the (larger) cap baked into the checkpoint.
     if getattr(args, 'max_clips', 0):
         config.max_clips = args.max_clips
+    # Allow overriding the target-confidence gate at eval time too.
+    if getattr(args, 'min_target_conf', 0.0):
+        config.min_target_conf = args.min_target_conf
 
     _ensure_videos(
         config.attack_mode,
@@ -227,14 +231,26 @@ def run_eval(args):
 
     test_items = [dataset[i] for i in range(len(dataset))]
 
-    print(f"\n=== Flip Rate (target objects only, {len(test_items)} clips) ===")
+    n_loaded     = sum(1 for it in test_items if it is not None)
+    total_frames = sum(len(it['frames']) for it in test_items if it is not None)
+
+    print(f"\n=== Test set ===")
+    print(f"Clips requested / loaded     : {len(test_items)} / {n_loaded}  "
+          f"(rest failed to download or load)")
+    print(f"Total frames                 : {total_frames}")
+    _mtc = getattr(config, 'min_target_conf', 0.0)
+    if _mtc > 0:
+        print(f"Target confidence gate       : category prob ≥ {_mtc:.2f}")
+
+    print(f"\n=== Flip Rate (attacked head, target objects only) ===")
     flip_results = compute_flip_rate_across_clips(
         vine_model, test_items, patch, anchor, config, torch.device(device)
     )
     clips_with = flip_results.get('n_clips_with_targets', '?')
-    print(f"Clips with target objects : {clips_with} / {len(test_items)}")
-    print(f"Flip rate : {flip_results['flip_rate']:.1%}  "
-          f"({flip_results['n_flipped']}/{flip_results['n_total']} target objects flipped)")
+    print(f"Clips with a target object   : {clips_with} / {n_loaded}")
+    print(f"Target objects (1 / clip)    : {flip_results['n_total']}")
+    print(f"Flipped                      : {flip_results['n_flipped']} / {flip_results['n_total']}")
+    print(f"Flip rate                    : {flip_results['flip_rate']:.1%}")
 
     print(f"\n=== Scene Graph Edit Distance (target objects only) ===")
     iso_results = evaluate_isolation(
@@ -243,30 +259,59 @@ def run_eval(args):
     mode   = config.attack_mode
     target = config.target_category or config.target_relation
 
-    attacked_label   = {'category': 'category', 'attribute': 'attribute', 'relation': 'relation'}[mode]
+    attacked_label   = mode
     collateral_heads = [h for h in ('category', 'attribute', 'relation') if h != attacked_label]
 
-    print(f"Mean target objects per clip : {iso_results['mean_n_target_objects']:.1f}")
-    print(f"[attacked]  {attacked_label}_change_rate  : "
-          f"{iso_results[f'mean_{attacked_label}_change_rate']:.1%}  ← higher = stronger attack")
+    head_ct = {
+        'category':  iso_results['total_category_changes'],
+        'attribute': iso_results['total_attribute_changes'],
+        'relation':  iso_results['total_relation_changes'],
+    }
+    n_obj = iso_results['total_target_objects']
+    denom = max(n_obj, 1)
+    attacked_ct = head_ct[attacked_label] + (
+        iso_results['total_disappeared'] if mode == 'category' else 0)
+
+    print(f"Target objects evaluated     : {n_obj}  "
+          f"(mean {iso_results['mean_n_target_objects']:.2f} / clip)")
+    print(f"Changes on those objects (count, % of {n_obj} objects):")
+    print(f"  [attacked]   {attacked_label:9s}: {head_ct[attacked_label]:4d}  "
+          f"({head_ct[attacked_label]/denom:.1%})   ← higher = stronger attack")
     for h in collateral_heads:
-        print(f"[collateral] {h}_change_rate : "
-              f"{iso_results[f'mean_{h}_change_rate']:.1%}  ← lower = better isolation")
-    print(f"Disappear rate               : {iso_results['mean_disappear_rate']:.1%}")
-    print(f"Isolation score              : {iso_results['mean_isolation_score']:.1%}  "
-          f"(fraction of changes on attacked head — higher = better)")
+        print(f"  [collateral] {h:9s}: {head_ct[h]:4d}  ({head_ct[h]/denom:.1%})"
+              f"   ← lower = better isolation")
+    print(f"  disappeared          : {iso_results['total_disappeared']:4d}  "
+          f"({iso_results['total_disappeared']/denom:.1%})")
+    print(f"  TOTAL changes        : {iso_results['total_changes']:4d}")
+
+    print(f"Isolation score:")
+    print(f"  pooled    : {iso_results['pooled_isolation_score']:.1%}  "
+          f"({attacked_ct}/{iso_results['total_changes']} of ALL changes hit the attacked head)")
+    print(f"  per-clip  : {iso_results['mean_isolation_score']:.1%}  "
+          f"(avg over clips; clips with NO changes count as 100% — inflates this)")
 
     # Save results as JSON in the same directory as the patch file
     results = {
         "patch":        args.patch,
         "attack_mode":  config.attack_mode,
         "target":       target,
-        "n_test_clips": len(test_items),
+        "n_test_clips_requested": len(test_items),
+        "n_test_clips_loaded":    n_loaded,
+        "total_frames":           total_frames,
         # Flip rate
         "flip_rate":    flip_results['flip_rate'],
         "n_flipped":    flip_results['n_flipped'],
         "n_total":      flip_results['n_total'],
-        # Edit distance rates (all normalised by n_target_objects per clip)
+        "n_clips_with_targets": flip_results.get('n_clips_with_targets'),
+        # Edit distance — raw counts (pooled)
+        "total_target_objects":    iso_results['total_target_objects'],
+        "total_category_changes":  iso_results['total_category_changes'],
+        "total_attribute_changes": iso_results['total_attribute_changes'],
+        "total_relation_changes":  iso_results['total_relation_changes'],
+        "total_disappeared":       iso_results['total_disappeared'],
+        "total_changes":           iso_results['total_changes'],
+        "pooled_isolation_score":  iso_results['pooled_isolation_score'],
+        # Edit distance — per-clip means (legacy)
         "mean_n_target_objects":      iso_results['mean_n_target_objects'],
         "mean_category_change_rate":  iso_results['mean_category_change_rate'],
         "mean_attribute_change_rate": iso_results['mean_attribute_change_rate'],
@@ -319,6 +364,10 @@ def main():
     parser.add_argument("--max-clips", type=int, default=0, dest="max_clips",
                         help="Cap clips loaded into RAM (0 = no cap). Each clip's masks "
                              "cost ~tens of MB; cap this on machines with limited RAM.")
+    parser.add_argument("--min-target-conf", type=float, default=0.0, dest="min_target_conf",
+                        help="Min VINE softmax confidence for the target category to accept an "
+                             "object as a target (0 = off). Drops weakly-classified targets "
+                             "(e.g. a table VINE calls 'person' at 0.3). Try 0.5.")
 
     # Eval
     parser.add_argument("--eval",  action="store_true", help="Run evaluation instead of training")

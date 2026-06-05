@@ -1,0 +1,91 @@
+# ============================================================
+#  NSAP — best attack targets, ranked by available data
+# ============================================================
+#
+# "Usable" = mask-covered clips (7864 total on disk); videos download on demand
+# (yt-dlp, some fail). Counts are clip-level. --target / --attribute / --relation
+# use SUBSTRING matching, so stems like "stand" / "hold" also catch "standing" /
+# "holding" — stems are used below to maximize data.
+#
+# Run once per session:
+#   conda activate NSAP
+#   export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+
+# ============================================================
+#  1. CATEGORY ATTACKS  (flip what an object IS)
+# ============================================================
+#   category      usable clips
+#   person        3685   <-- best by far
+#   woman          887
+#   man            768
+#   hand           689
+#   child          325
+#   car            189
+#   table          174
+
+python run_attack.py --mode category --target person --no-chameleon --max-clips 400 --batch 2
+python run_attack.py --eval --patch output/patches/category_person/category_person_final.pt --max-clips 50
+
+python run_attack.py --mode category --target woman --no-chameleon --max-clips 400 --batch 2
+python run_attack.py --eval --patch output/patches/category_woman/category_woman_final.pt --max-clips 50
+
+python run_attack.py --mode category --target man --no-chameleon --max-clips 400 --batch 2
+python run_attack.py --eval --patch output/patches/category_man/category_man_final.pt --max-clips 50
+
+
+# ============================================================
+#  2. ATTRIBUTE ATTACKS  (flip an action/attribute of an object)
+# ============================================================
+#   category + attribute     usable clips
+#   person + stand           ~498   (stand 397 + standing 101)   <-- best
+#   person + gesture          151
+#   person + walk             147
+#   person + sit              130
+#   person + dance             65
+#   person + run               52
+#   man    + stand             90
+#   woman  + stand             88
+#   man    + walk              79
+#   woman  + walk              78
+#   (skipped: "close up" / "appear" / "background" — camera/scene shot
+#    descriptors, not body attributes; valid targets but less meaningful)
+
+python run_attack.py --mode attribute --target person --attribute stand --no-chameleon --max-clips 400 --batch 2
+python run_attack.py --eval --patch output/patches/attribute_person_stand/attribute_person_stand_final.pt --max-clips 50
+
+python run_attack.py --mode attribute --target person --attribute walk --no-chameleon --max-clips 400 --batch 2
+python run_attack.py --eval --patch output/patches/attribute_person_walk/attribute_person_walk_final.pt --max-clips 50
+
+python run_attack.py --mode attribute --target person --attribute sit --no-chameleon --max-clips 400 --batch 2
+python run_attack.py --eval --patch output/patches/attribute_person_sit/attribute_person_sit_final.pt --max-clips 50
+
+
+# ============================================================
+#  3. RELATION ATTACKS  (flip a relation whose SUBJECT is the target)
+# ============================================================
+#   subject + relation       usable person-subject clips (substring)
+#   person + hold            1162   (hold + holding)             <-- best
+#   person + wear            1080   (wear + wearing)
+#   hand   + hold            ~227
+#   woman  + wear            ~262
+#   man    + wear            ~215
+#   person + adjust           226
+#
+#   NOTE: in relation mode --max-clips caps clips BEFORE the relation filter, so
+#   only ~15% of capped clips match a common relation (~60 "hold" clips at
+#   --max-clips 400). Raise --max-clips (RAM permitting) for a bigger pool.
+
+python run_attack.py --mode relation --target person --relation hold --no-chameleon --max-clips 400 --batch 2
+python run_attack.py --eval --patch output/patches/relation_hold_person/relation_hold_person_final.pt --max-clips 50
+
+python run_attack.py --mode relation --target person --relation wear --no-chameleon --max-clips 400 --batch 2
+python run_attack.py --eval --patch output/patches/relation_wear_person/relation_wear_person_final.pt --max-clips 50
+
+
+# ============================================================
+#  TOP PICKS (most data, cleanest signal)
+# ============================================================
+#   category  : person
+#   attribute : person + stand
+#   relation  : person + hold

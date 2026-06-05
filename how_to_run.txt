@@ -1,26 +1,73 @@
-# Category attack
-python run_attack.py --mode category --target person
-python run_attack.py --mode category --target cup
-python run_attack.py --mode category --target dog
+# ============================================================
+#  NSAP — how to run
+# ============================================================
+#
+# Machine-tuning flags (this box: RTX 3070 8 GB GPU + 30 GB RAM):
+#   --no-chameleon   drop VGG16 + DINOv2 from the GPU   (TRAINING only)
+#   --max-clips 400  cap clips held in RAM while training
+#   --max-clips 50   cap clips while evaluating (eval loads frames eagerly)
+#   --batch 2        EoT batch size that fits 8 GB
+#   PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True   avoid CUDA fragmentation
+# On a bigger machine: raise --batch, raise/drop --max-clips, drop --no-chameleon.
+#
+# Run these two once per shell session:
+conda activate NSAP
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 
-# Relation attack
-python run_attack.py --mode relation --relation "holding" --target person
-python run_attack.py --mode relation --relation "next to" --target person
-python run_attack.py --mode relation --relation "wearing" --target person
-
-# Evaluation (after training completes)
-python run_attack.py --eval --patch output/patches/category_person/category_person_final.pt
-python run_attack.py --eval --patch output/patches/attribute_standing/attribute_standing_final.pt
-python run_attack.py --eval --patch output/patches/relation_holding_person/relation_holding_person_final.pt
+# ---- 0. One-time setup (VINE weights + LASER + dataset masks) ----
+python NSAP.py
+# Optional: pull more videos for a target before training
+# python NSAP.py --download-more --category person --attribute standing --max 500
 
 
-# Attribute attack: target the "standing" attribute of "person" objects
-python run_attack.py --mode attribute --target person --attribute standing
+# ---- 1. Sanity checks (optional but recommended) ----
+# train/eval CLIP-forward parity (expect feature cosine ~1.0, 0 top-1 mismatches)
+python -m functions.eval.consistency_check
+# bbox derivation + frame/mask alignment + overlay images
+python run_attack.py --validate-bboxes --target person --n-clips 5 --keep-videos
 
-# Attribute attack: "walking" attribute of "woman"
-python run_attack.py --mode attribute --target woman --attribute walking
 
-# Eval
-python run_attack.py --eval --patch output/patches/attribute_person_standing/attribute_person_standing_final.pt
+# ---- 2. Category attack: flip "person" ----
+python run_attack.py --mode category --target person --no-chameleon --max-clips 400 --batch 2
+python run_attack.py --eval --patch output/patches/category_person/category_person_final.pt --max-clips 50
 
+# other category targets (videos download on demand)
+python run_attack.py --mode category --target cup --no-chameleon --max-clips 400 --batch 2
+python run_attack.py --eval --patch output/patches/category_cup/category_cup_final.pt --max-clips 50
+
+python run_attack.py --mode category --target dog --no-chameleon --max-clips 400 --batch 2
+python run_attack.py --eval --patch output/patches/category_dog/category_dog_final.pt --max-clips 50
+
+
+# ---- 3. Attribute attack: flip an attribute of an object ----
+# person + "stand"  (substring match, so "stand" also hits "standing")
+python run_attack.py --mode attribute --target person --attribute stand --no-chameleon --max-clips 400 --batch 2
+python run_attack.py --eval --patch output/patches/attribute_person_stand/attribute_person_stand_final.pt --max-clips 50
+
+# woman + "walking"
+python run_attack.py --mode attribute --target woman --attribute walking --no-chameleon --max-clips 400 --batch 2
+python run_attack.py --eval --patch output/patches/attribute_woman_walking/attribute_woman_walking_final.pt --max-clips 50
+
+
+# ---- 4. Relation attack: flip a relation whose subject is the target ----
+# person + "holding"
+python run_attack.py --mode relation --target person --relation holding --no-chameleon --max-clips 400 --batch 2
+python run_attack.py --eval --patch output/patches/relation_holding_person/relation_holding_person_final.pt --max-clips 50
+
+# person + "next to"  (spaces in the slug become underscores)
+python run_attack.py --mode relation --target person --relation "next to" --no-chameleon --max-clips 400 --batch 2
+python run_attack.py --eval --patch output/patches/relation_next_to_person/relation_next_to_person_final.pt --max-clips 50
+
+# person + "wearing"
+python run_attack.py --mode relation --target person --relation wearing --no-chameleon --max-clips 400 --batch 2
+python run_attack.py --eval --patch output/patches/relation_wearing_person/relation_wearing_person_final.pt --max-clips 50
+
+
+# ---- Notes ----
+# * Patch dir/slug rules:
+#     category  -> output/patches/category_<target>/category_<target>_final.pt
+#     attribute -> output/patches/attribute_<target>_<attr>/attribute_<target>_<attr>_final.pt
+#     relation  -> output/patches/relation_<rel>_<target>/relation_<rel>_<target>_final.pt   (spaces -> _)
+# * Eval also writes sample images to <patch-dir>/samples/ (worked_* / failed_*).
+# * Videos are downloaded on demand per attack and deleted afterwards unless you pass --keep-videos.

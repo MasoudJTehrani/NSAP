@@ -197,6 +197,15 @@ def compute_flip_rate_across_clips(
                     if config.target_attribute.lower() in (sg_clean.attributes.get(oid) or '').lower()
                 }
 
+            # Confidence gate: drop objects VINE only weakly calls the target
+            # category (e.g. a table at 0.3). Matches training's min_target_conf.
+            _min_conf = getattr(config, 'min_target_conf', 0.0)
+            if _min_conf > 0:
+                target_obj_ids = {
+                    oid for oid in target_obj_ids
+                    if sg_clean.category_conf.get(oid, 0.0) >= _min_conf
+                }
+
             # Targeting policy: attack only the largest target object per clip
             # (masks are over-segmented; ignore fragments). Matches training.
             if config.target_category:
@@ -234,6 +243,13 @@ def compute_flip_rate_across_clips(
                 target_pairs = {
                     p for p in target_pairs
                     if config.target_category.lower() in sg_clean.categories.get(p[0], '').lower()
+                }
+
+            _min_conf = getattr(config, 'min_target_conf', 0.0)
+            if _min_conf > 0:
+                target_pairs = {
+                    p for p in target_pairs
+                    if sg_clean.category_conf.get(p[0], 0.0) >= _min_conf
                 }
 
             for pair in target_pairs:
