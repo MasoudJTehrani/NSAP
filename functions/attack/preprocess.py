@@ -216,8 +216,9 @@ def clip_preprocess_torch(img_hwc: torch.Tensor, image_size: int = 224) -> torch
     eval. Verified to reproduce the eval image features to cosine 1.0000.
 
     The eval path applies, in order:
-      1. cv2.cvtColor(img, BGR2RGB) on an already-RGB frame — i.e. a channel
-         REVERSAL, so CLIP actually receives the image in BGR order. We mirror it.
+      1. RGB is kept as-is. (Historically eval did cv2.cvtColor(BGR2RGB) on an
+         already-RGB frame — a channel REVERSAL that fed CLIP BGR; that swap was a
+         bug, now removed from both eval and here. VINE/SGClip expects RGB.)
       2. CLIPImageProcessor: resize the SHORTEST edge to image_size (bicubic,
          antialiased), center-crop image_size × image_size, rescale 1/255,
          normalize with CLIP mean/std. NOTE: this is resize-shortest-edge +
@@ -231,8 +232,7 @@ def clip_preprocess_torch(img_hwc: torch.Tensor, image_size: int = 224) -> torch
     Returns:
         [1, 3, image_size, image_size] float tensor, ready for clip vision_model
     """
-    x = img_hwc.permute(2, 0, 1).unsqueeze(0).float()   # [1, 3, H, W], RGB
-    x = x[:, [2, 1, 0], :, :]                           # RGB → BGR  (mirrors cvtColor, step 1)
+    x = img_hwc.permute(2, 0, 1).unsqueeze(0).float()   # [1, 3, H, W], RGB (kept RGB)
 
     # Resize shortest edge → image_size, preserving aspect ratio (step 2a)
     h, w = x.shape[-2], x.shape[-1]

@@ -24,10 +24,28 @@ Supported sources
   liwei_youtube_videos  (ytb_XXXXXXXXXXX)  →  ~8171 videos
   activitynet           (v_XXXXXXXXXXX)    →    ~92 videos
   Skipped: ego4d, Charades, NextQA, hash-named clips (not on YouTube)
+
+Reliability / rate-limit mitigation
+-----------------------------------
+YouTube rate-limits anonymous bulk downloads ("video unavailable, try again
+later"). Downloads now retry, sleep between requests, and back off on a run of
+failures. Tune via environment variables:
+
+  NSAP_YTDLP_SLEEP            base seconds to sleep before each video (default 2;
+                             actual sleep is randomised up to 3x this).
+  NSAP_YTDLP_COOKIES         path to a cookies.txt (Netscape format) exported from
+                             a logged-in browser — the single biggest win against
+                             rate-limiting. Auto-detected if a cookies.txt sits in
+                             the project root or dataset/ folder.
+  NSAP_YTDLP_COOKIES_BROWSER browser name to pull cookies from directly instead of
+                             a file (e.g. "firefox", "chrome"). Used only if no
+                             cookie file is found.
 """
 
+import os
 import sys
 import json
+import time
 import shutil
 from pathlib import Path
 
@@ -104,10 +122,55 @@ def _datapoint_matches(datapoint: dict, targets: list) -> bool:
     return False
 
 
+def _cookie_opts() -> dict:
+    """
+    Resolve yt-dlp cookie options from env / auto-detection.
+    Priority: NSAP_YTDLP_COOKIES file > auto-detected cookies.txt > browser cookies.
+    """
+    cf = os.environ.get("NSAP_YTDLP_COOKIES", "").strip()
+    if not cf:
+        for cand in (ROOT / "cookies.txt", DATASET_DIR / "cookies.txt"):
+            if cand.exists():
+                cf = str(cand)
+                break
+    if cf and os.path.exists(cf):
+        return {"cookiefile": cf}
+
+    browser = os.environ.get("NSAP_YTDLP_COOKIES_BROWSER", "").strip()
+    if browser:
+        return {"cookiesfrombrowser": (browser.lower(),)}
+    return {}
+
+
+def _build_ydl_opts() -> dict:
+    """yt-dlp options tuned to survive YouTube rate-limiting."""
+    sleep = float(os.environ.get("NSAP_YTDLP_SLEEP", "2"))
+    opts = {
+        "format":       "best[height<=360]/worst",
+        "outtmpl":      str(VIDEOS_DIR / "%(id)s.%(ext)s"),
+        "quiet":        True,
+        "no_warnings":  True,
+        "ignoreerrors": True,
+        # retry transient network / fragment / extractor failures
+        "retries":            5,
+        "fragment_retries":   5,
+        "extractor_retries":  3,
+        # throttle so YouTube is less likely to soft-block the session
+        "sleep_interval":          sleep,                 # min sleep before a download
+        "max_sleep_interval":      max(sleep, sleep * 3), # randomised up to 3x
+        "sleep_interval_requests": 1,                     # sleep between metadata requests
+    }
+    opts.update(_cookie_opts())
+    return opts
+
+
 def _run_downloads(yt_dlp_mod, pending: list) -> list:
     """
     Download a list of (video_id, yt_id) pairs.
     Returns list of failed video_ids.
+
+    Hardened against rate-limiting: retries + per-request sleep (see _build_ydl_opts),
+    plus an adaptive cool-down when many downloads fail in a row.
     """
     if not pending:
         return []
@@ -115,18 +178,28 @@ def _run_downloads(yt_dlp_mod, pending: list) -> list:
     VIDEOS_DIR.mkdir(parents=True, exist_ok=True)
     failed = []
 
-    ydl_opts = {
-        "format":       "best[height<=360]/worst",
-        "outtmpl":      str(VIDEOS_DIR / "%(id)s.%(ext)s"),
-        "quiet":        True,
-        "no_warnings":  True,
-        "ignoreerrors": True,
-    }
+    ydl_opts = _build_ydl_opts()
+    if "cookiefile" in ydl_opts:
+        print(f"  Using cookies file: {ydl_opts['cookiefile']}")
+    elif "cookiesfrombrowser" in ydl_opts:
+        print(f"  Using cookies from browser: {ydl_opts['cookiesfrombrowser'][0]}")
+    else:
+        print("  No cookies (anonymous) — set NSAP_YTDLP_COOKIES to a cookies.txt "
+              "to cut rate-limit failures.")
+    print(f"  Throttle: sleep {ydl_opts['sleep_interval']}-{ydl_opts['max_sleep_interval']}s "
+          f"between videos, retries={ydl_opts['retries']}.")
+
+    COOLDOWN_AFTER = 8      # consecutive failures before a longer pause
+    COOLDOWN_SECS  = 60     # how long to pause (let the rate-limit cool off)
+    consecutive_fail = 0
 
     with yt_dlp_mod.YoutubeDL(ydl_opts) as ydl:
         for i, (video_id, yt_id) in enumerate(pending, 1):
             print(f"  [{i}/{len(pending)}] {video_id} ...", end=" ", flush=True)
-            ydl.download([f"{YOUTUBE_BASE}{yt_id}"])
+            try:
+                ydl.download([f"{YOUTUBE_BASE}{yt_id}"])
+            except Exception:
+                pass  # ignoreerrors handles most; this guards the rest
 
             renamed = False
             for f in VIDEOS_DIR.glob(f"{yt_id}.*"):
@@ -136,9 +209,15 @@ def _run_downloads(yt_dlp_mod, pending: list) -> list:
 
             if renamed:
                 print("ok")
+                consecutive_fail = 0
             else:
                 print("FAILED (unavailable / private / geo-blocked)")
                 failed.append(video_id)
+                consecutive_fail += 1
+                if consecutive_fail and consecutive_fail % COOLDOWN_AFTER == 0:
+                    print(f"  ⚠ {consecutive_fail} failures in a row — likely rate-limited; "
+                          f"cooling down {COOLDOWN_SECS}s (Ctrl-C to stop).")
+                    time.sleep(COOLDOWN_SECS)
 
     return failed
 

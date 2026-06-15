@@ -21,6 +21,25 @@ python NSAP.py
 # python NSAP.py --download-more --category person --attribute standing --max 500
 
 
+# ---- 0b. Videos / yt-dlp reliability ----
+# NOTE: the dataset ships only masks + annotations, NO videos. Videos are fetched
+# from YouTube on demand by run_attack.py (and deleted after, unless --keep-videos).
+# YouTube rate-limits anonymous bulk downloads, so many clips fail. Mitigations:
+#
+#   Best fix — cookies: export a logged-in YouTube cookies.txt (browser extension
+#   "Get cookies.txt LOCALLY") and drop it here; it's auto-detected:
+#       /home/usi/NSAP/cookies.txt
+#   Or pull cookies straight from the browser:
+#       export NSAP_YTDLP_COOKIES_BROWSER=firefox     # or chrome
+#   Or point at a cookie file explicitly:
+#       export NSAP_YTDLP_COOKIES=/path/to/cookies.txt
+#
+#   Go gentler on the rate limit (slower, fewer failures):
+#       export NSAP_YTDLP_SLEEP=3                      # base sleep; 3-9s per video
+#
+# Downloads already retry + throttle + back off 60s after 8 failures in a row.
+
+
 # ---- 1. Sanity checks (optional but recommended) ----
 # train/eval CLIP-forward parity (expect feature cosine ~1.0, 0 top-1 mismatches)
 python -m functions.eval.consistency_check

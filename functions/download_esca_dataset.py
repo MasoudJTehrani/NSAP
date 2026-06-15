@@ -4,8 +4,11 @@ Download the ESCA-video-87K dataset (LASER project) from HuggingFace into the da
   Annotations : gpt_specs1_id_LLaVA_all.jsonl  (~211 MB)
                 gpt_specs2_id_LLaVA_all.jsonl  (~407 MB)
                 neg_examples.jsonl             (~1.91 GB)
-  Mask subset : mini_LLaVA_10000_masks.tar.gz  (~2.28 GB)
-  Video chunks: chunk_000.tar.gz ... chunk_043.tar.gz (~33 GB)
+  Mask subset : mini_LLaVA_10000_masks.tar.gz  (~2.28 GB, the 10k-clip subset NSAP uses)
+  Mask chunks : chunk_000.tar.gz ... chunk_043.tar.gz (~33 GB) — the FULL ~87K-clip
+                mask set. These are MASKS, not videos (confirmed: each chunk is
+                thousands of *_mask.pkl files). The dataset contains NO videos at
+                all; videos must be fetched from YouTube via download_videos.py.
 
 Source: https://huggingface.co/datasets/video-fm/ESCA-video-87K
 """
@@ -75,8 +78,10 @@ def _extract(archive: Path, cleanup: bool = False) -> None:
 
 def main(download_chunks: bool = False, cleanup: bool = False) -> None:
     """
-    download_chunks: download all 44 video chunk archives (~33 GB compressed).
-                     Use download_videos.py instead for a selective yt-dlp download.
+    download_chunks: download all 44 mask-chunk archives (~33 GB compressed) — the
+                     FULL ~87K-clip mask set. These are MASKS, not videos. (Videos
+                     are not part of this dataset; fetch them from YouTube with
+                     download_videos.py.)
     cleanup:         delete archives after extraction to save space.
     """
     hf = _require_hf_hub()
@@ -100,12 +105,13 @@ def main(download_chunks: bool = False, cleanup: bool = False) -> None:
         MASKS_SENTINEL.touch()
 
     if download_chunks:
-        print("\n=== Video chunks (44 files, ~33 GB) ===")
+        print("\n=== Full mask set: 44 chunks (~33 GB, ~87K clips' masks — NOT videos) ===")
         for fname in [f"chunk_{i:03d}.tar.gz" for i in range(44)]:
             archive = _download_file(hf, fname)
             _extract(archive, cleanup=cleanup)
     else:
-        print("\nSkipping video chunks. Use functions/download_videos.py for selective yt-dlp download.")
+        print("\nSkipping the full mask chunks (~33 GB); using the mini 10k mask subset.")
+        print("Note: videos are NOT in this dataset — fetch them from YouTube via download_videos.py.")
 
     print("\nAll done. Dataset is in:", DATASET_DIR)
 

@@ -30,6 +30,7 @@ def predict_scene_graph(
     gpt_spec: dict,
     device: torch.device,
     return_top_k: int = 1,
+    single_frame: bool = True,
 ) -> SceneGraph:
     """
     Run VINE's predict() method and return a SceneGraph.
@@ -45,6 +46,8 @@ def predict_scene_graph(
         gpt_spec:      gpt_spec dict for this clip (provides keyword lists)
         device:        torch device
         return_top_k:  number of top predictions to aggregate (default 1)
+        single_frame:  evaluate on ONE frame (default True), to match how ESCA
+                       queries VINE — one frame at a time. See note below.
 
     Returns:
         SceneGraph with per-object top-1 predictions
@@ -52,6 +55,26 @@ def predict_scene_graph(
     cat_kws    = gpt_spec.get('consts',      [])
     unary_kws  = gpt_spec.get('unary_kws',   [])
     binary_kws = gpt_spec.get('binary_kws',  [])
+
+    # ── Lock evaluation to a single frame (match ESCA's inference) ────────────
+    # ESCA queries VINE one frame at a time (predict_laser wraps a single image
+    # as a length-1 "video"), and VINE itself does no cross-frame reasoning.
+    # Evaluating on the whole clip otherwise misrepresents deployment: the
+    # category head silently keeps only the LAST frame's result (its key drops
+    # frame_id and overwrites), while attribute/relation get majority-voted
+    # across frames. Pick the single frame with the largest total mask area
+    # (objects clearest), tie-broken by lowest frame_id. The choice depends only
+    # on masks, so the clean and patched passes always select the SAME frame.
+    if single_frame and len(masks) > 0:
+        valid_fids = [fid for fid in masks if fid < len(frames)]
+        if valid_fids:
+            sel = max(
+                valid_fids,
+                key=lambda fid: (sum(int(m.sum()) for m in masks[fid].values()), -fid),
+            )
+            frames = [frames[sel]]
+            masks  = {0: masks[sel]}
+            bboxes = {0: bboxes.get(sel, {})}
 
     # Stack frames into a tensor [N, H, W, 3]
     video_tensor = torch.stack(frames).to(device)
@@ -89,7 +112,8 @@ def predict_scene_graph(
 
     sg = SceneGraph(data_id="")
 
-    # Aggregate predictions across frames: take majority-vote top-1
+    # Aggregate predictions across frames: take majority-vote top-1.
+    # Under single_frame=True there is exactly one frame, so the vote is trivial.
     cat_votes:  Dict[int, Dict[str, int]] = {}
     attr_votes: Dict[int, Dict[str, int]] = {}
     rel_votes:  Dict[Tuple[int,int], Dict[str, int]] = {}
