@@ -72,6 +72,21 @@ class AttackConfig:
     # category head (relation: the subject's category).
     min_target_conf: float = 0.0
 
+    # If set, train/eval on a SceneGraphBench (AI2-THOR) dataset at this path
+    # instead of the YouTube/ESCA dataset. Frames are PNGs and labels are sim
+    # ground truth (see functions/attack/sim_data.py::SimAttackDataset).
+    sim_data_dir: str = ''
+
+    # Two-phase chameleon experiment (sim only):
+    #   use_all_data    — train on ALL scenarios (no train/test split).
+    #   init_patch_path — warm-start from this patch (loads its weights + anchor,
+    #                     skips SAM anchor selection). Phase 2 continues training it.
+    #   only_scenario   — restrict train/eval to this single scenario id, so the
+    #                     chameleon camouflage overfits one specific kitchen.
+    use_all_data: bool = False
+    init_patch_path: str = ''
+    only_scenario: str = ''
+
     # Checkpointing
     save_every: int          = 200
     output_dir: str          = "output/patches"
@@ -252,14 +267,28 @@ def train_patch(
 
     # ── Load dataset ──────────────────────────────────────────────────────────
     print(f"\n=== Loading dataset for {config.attack_mode} attack on '{config.target_category}' ===")
-    dataset = EscaAttackDataset(
-        dataset_dir=dataset_dir,
-        dataset_filename=dataset_filename,
-        target_category=config.target_category if config.attack_mode != 'relation' else None,
-        target_attribute=config.target_attribute if config.attack_mode == 'attribute' else None,
-        split='train',
-        max_clips=config.max_clips,
-    )
+    if getattr(config, 'sim_data_dir', ''):
+        from functions.attack.sim_data import SimAttackDataset
+        _only = [config.only_scenario] if getattr(config, 'only_scenario', '') else None
+        _split = None if (getattr(config, 'use_all_data', False) or _only) else 'train'
+        dataset = SimAttackDataset(
+            config.sim_data_dir,
+            target_category=config.target_category if config.attack_mode != 'relation' else None,
+            target_attribute=config.target_attribute if config.attack_mode == 'attribute' else None,
+            target_relation=config.target_relation if config.attack_mode == 'relation' else None,
+            split=_split,
+            max_clips=config.max_clips,
+            only_scenarios=_only,
+        )
+    else:
+        dataset = EscaAttackDataset(
+            dataset_dir=dataset_dir,
+            dataset_filename=dataset_filename,
+            target_category=config.target_category if config.attack_mode != 'relation' else None,
+            target_attribute=config.target_attribute if config.attack_mode == 'attribute' else None,
+            split='train',
+            max_clips=config.max_clips,
+        )
 
     if config.attack_mode == 'relation':
         instances = dataset.build_relation_instance_list(
@@ -289,35 +318,43 @@ def train_patch(
     instances = _keep_largest_target_per_clip(instances, config)
     print(f"  → {len(instances)} instances after largest-target-per-clip filter.")
 
-    # ── Phase 0a: SAM anchor selection ───────────────────────────────────────
-    print("\n=== Phase 0a: SAM anchor selection ===")
-    if config.attack_mode == 'relation':
-        anchor = select_relation_anchor(
-            relation_instances=instances,
-            vine_model=vine_model,
-            target_relation=config.target_relation,
-            coverage_ratio=config.coverage_ratio,
-            warmup_steps=config.sam_anchor_warmup,
-            device=device,
-            sam_predictor=sam_predictor,
-            clip_image_size=config.clip_image_size,
-        )
+    # ── Phase 0a: anchor (SAM selection, or reuse a warm-start patch's anchor) ──
+    if getattr(config, 'init_patch_path', ''):
+        print("\n=== Phase 0a: reusing anchor from warm-start patch ===")
+        _init_ckpt = torch.load(config.init_patch_path, map_location=device, weights_only=False)
+        anchor = _init_ckpt['anchor']
+        print(f"  anchor = {anchor}  (from {config.init_patch_path})")
     else:
-        anchor = select_anchor(
-            instances=instances,
-            vine_model=vine_model,
-            attack_mode=config.attack_mode,
-            target_category=config.target_category,
-            coverage_ratio=config.coverage_ratio,
-            warmup_steps=config.sam_anchor_warmup,
-            device=device,
-            sam_predictor=sam_predictor,
-            clip_image_size=config.clip_image_size,
-            target_attribute=config.target_attribute,
-        )
+        _init_ckpt = None
+        print("\n=== Phase 0a: SAM anchor selection ===")
+        if config.attack_mode == 'relation':
+            anchor = select_relation_anchor(
+                relation_instances=instances,
+                vine_model=vine_model,
+                target_relation=config.target_relation,
+                coverage_ratio=config.coverage_ratio,
+                warmup_steps=config.sam_anchor_warmup,
+                device=device,
+                sam_predictor=sam_predictor,
+                clip_image_size=config.clip_image_size,
+            )
+        else:
+            anchor = select_anchor(
+                instances=instances,
+                vine_model=vine_model,
+                attack_mode=config.attack_mode,
+                target_category=config.target_category,
+                coverage_ratio=config.coverage_ratio,
+                warmup_steps=config.sam_anchor_warmup,
+                device=device,
+                sam_predictor=sam_predictor,
+                clip_image_size=config.clip_image_size,
+                target_attribute=config.target_attribute,
+            )
 
     # SAM2 is only needed for Phase 0a — free it before loading DINOv2 + VGG
-    del sam_predictor
+    if sam_predictor is not None:
+        del sam_predictor
     torch.cuda.empty_cache()
 
     # ── Phase 0b: DINO diversity clustering ──────────────────────────────────
@@ -327,11 +364,14 @@ def train_patch(
     for p in dino_model.parameters():
         p.requires_grad_(False)
 
+    # Cap clusters at the instance count (a single scenario has only ~12 frames,
+    # so k=20 would crash KMeans).
+    eff_k = max(1, min(config.dino_cluster_k, len(instances)))
     cluster_labels = _build_dino_clusters(
         instances=instances,
         dino_model=dino_model,
         dino_preprocess_fn=dino_preprocess_torch,
-        k=config.dino_cluster_k,
+        k=eff_k,
         device=device,
     )
 
@@ -368,12 +408,20 @@ def train_patch(
         vgg_mean, vgg_std = build_vgg_normalisation_tensors(device)
 
     # ── Initialise patch and optimizer ───────────────────────────────────────
-    sample_bbox = (
-        instances[0]['bbox'] if config.attack_mode != 'relation'
-        else instances[0]['subj_bbox']
-    )
-    patch_h, patch_w = compute_patch_size(sample_bbox, config.coverage_ratio)
-    patch     = AdversarialPatch(patch_h, patch_w, device)
+    if _init_ckpt is not None:
+        # Warm-start: match the Phase-1 patch's canonical size and load its weights,
+        # so Phase 2 continues training the SAME patch (adding chameleon camouflage).
+        patch_h, patch_w = _init_ckpt['w'].shape[1], _init_ckpt['w'].shape[2]
+        patch = AdversarialPatch(patch_h, patch_w, device)
+        patch.w.data.copy_(_init_ckpt['w'].to(device))
+        print(f"  Warm-started patch ({patch_h}x{patch_w}) from {config.init_patch_path}")
+    else:
+        sample_bbox = (
+            instances[0]['bbox'] if config.attack_mode != 'relation'
+            else instances[0]['subj_bbox']
+        )
+        patch_h, patch_w = compute_patch_size(sample_bbox, config.coverage_ratio)
+        patch = AdversarialPatch(patch_h, patch_w, device)
     optimizer = optim.Adam(patch.parameters(), lr=config.learning_rate)
 
     os.makedirs(config.output_dir, exist_ok=True)
@@ -385,7 +433,7 @@ def train_patch(
         optimizer.zero_grad()
 
         # Diversity-sampled mini-batch
-        batch = _diversity_sample(instances, cluster_labels, config.eot_batch_size, config.dino_cluster_k)
+        batch = _diversity_sample(instances, cluster_labels, config.eot_batch_size, eff_k)
 
         step_attack   = torch.tensor(0.0, device=device)
         step_gram     = torch.tensor(0.0, device=device)
@@ -592,10 +640,14 @@ def _filter_by_clean_prediction(
         crop_image_contain_bboxes_torch,
     )
 
-    def _head_top1_ok(enc, proc_img, kws, target, min_conf: float = 0.0) -> bool:
+    _sim = bool(getattr(config, 'sim_data_dir', ''))
+
+    def _head_top1_ok(enc, proc_img, kws, target, min_conf: float = 0.0,
+                      exact: bool = False) -> bool:
         """
-        True if `target` is empty (no gate), or VINE's top-1 over `kws` contains
-        `target` AND its softmax confidence is >= min_conf.
+        True if `target` is empty (no gate), or VINE's top-1 over `kws` matches
+        `target` — EXACT word when `exact` (sim categories: 'pot' != 'potato'),
+        else substring (YouTube: 'stand' ⊂ 'standing') — AND prob >= min_conf.
         """
         if not target:
             return True
@@ -605,7 +657,8 @@ def _filter_by_clean_prediction(
             scores = _clip_scores(vine_model, enc, proc_img, kws, device, config.clip_image_size)
             probs  = torch.softmax(scores, dim=-1)
         i = int(probs.argmax().item())
-        if target.lower() not in kws[i].lower():
+        ok = (target.lower() == kws[i].lower()) if exact else (target.lower() in kws[i].lower())
+        if not ok:
             return False
         return float(probs[i].item()) >= min_conf
 
@@ -623,12 +676,14 @@ def _filter_by_clean_prediction(
 
                 if config.attack_mode == 'category':
                     ok = _head_top1_ok(vine_model.clip_cate_model, proc, consts,
-                                       config.target_category, min_conf=config.min_target_conf)
+                                       config.target_category, min_conf=config.min_target_conf,
+                                       exact=_sim)
                 else:
                     # attribute: require BOTH the target category (confidently) AND the attribute
                     ok = (
                         _head_top1_ok(vine_model.clip_cate_model,  proc, consts,
-                                      config.target_category, min_conf=config.min_target_conf)
+                                      config.target_category, min_conf=config.min_target_conf,
+                                      exact=_sim)
                         and
                         _head_top1_ok(vine_model.clip_unary_model, proc, spec.get('unary_kws', []),
                                       config.target_attribute)
@@ -643,7 +698,8 @@ def _filter_by_clean_prediction(
                 # subject category gate — full-frame whitened subject, as eval classifies it
                 proc_subj = extract_single_object_torch(frame, subj_mask, alpha=vine_model.config.alpha)
                 if not _head_top1_ok(vine_model.clip_cate_model, proc_subj, consts,
-                                     config.target_category, min_conf=config.min_target_conf):
+                                     config.target_category, min_conf=config.min_target_conf,
+                                     exact=_sim):
                     continue
 
                 # relation gate — subject+object crop, as eval classifies the relation

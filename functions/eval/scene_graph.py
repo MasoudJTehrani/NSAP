@@ -100,6 +100,18 @@ def predict_scene_graph(
                 ).squeeze(0).squeeze(0).bool()
             masks_tensor[fid][oid] = m
 
+    # VINE scores relations ONLY for the pairs passed in `object_pairs` — its
+    # forward skips binary entirely when that list is empty. So a relation eval
+    # MUST supply pairs, or sg.relations stays empty and every relation attack
+    # reads 0 targets (while training, which scores each pair explicitly, finds
+    # plenty). Pass all ordered object pairs; the forward filters to
+    # overlapping-bbox pairs. Skip the work when there are no binary keywords.
+    if binary_kws:
+        oids = sorted({oid for fobj in masks_tensor.values() for oid in fobj})
+        object_pairs = [(i, j) for i in oids for j in oids if i != j]
+    else:
+        object_pairs = []
+
     results = vine_model.predict(
         video_frames=video_tensor,
         masks=masks_tensor,
@@ -107,6 +119,7 @@ def predict_scene_graph(
         categorical_keywords=cat_kws,
         unary_keywords=unary_kws,
         binary_keywords=binary_kws,
+        object_pairs=object_pairs,
         return_top_k=return_top_k,
     )
 

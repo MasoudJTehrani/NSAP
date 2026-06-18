@@ -107,7 +107,8 @@ def load_vine(device: str) -> "VineModel":
 def run_train(args):
     from functions.attack.train import train_patch, AttackConfig
 
-    _ensure_videos(args.mode, args.target, args.attribute, args.relation, split='train')
+    if not args.sim_data:
+        _ensure_videos(args.mode, args.target, args.attribute, args.relation, split='train')
 
     attack_dir = _attack_subdir(args.output_dir, args.mode, args.target, args.relation, args.attribute)
 
@@ -132,6 +133,13 @@ def run_train(args):
         use_chameleon    = args.use_chameleon,
         max_clips        = args.max_clips,
         min_target_conf  = args.min_target_conf,
+        sim_data_dir     = args.sim_data,
+        use_all_data     = args.all_data,
+        init_patch_path  = args.init_patch,
+        only_scenario    = args.only_scenario,
+        lambda_c         = args.lambda_c,
+        lambda_tv        = args.lambda_tv,
+        lambda_dino      = args.lambda_dino,
     )
 
     device     = args.device
@@ -206,30 +214,59 @@ def run_eval(args):
     # Allow overriding the target-confidence gate at eval time too.
     if getattr(args, 'min_target_conf', 0.0):
         config.min_target_conf = args.min_target_conf
+    # Allow pointing eval at a sim dataset (overrides whatever the ckpt stored).
+    if getattr(args, 'sim_data', ''):
+        config.sim_data_dir = args.sim_data
 
-    _ensure_videos(
-        config.attack_mode,
-        config.target_category,
-        getattr(config, 'target_attribute', ''),
-        getattr(config, 'target_relation', ''),
-        split='test',
-    )
+    if not getattr(config, 'sim_data_dir', ''):
+        _ensure_videos(
+            config.attack_mode,
+            config.target_category,
+            getattr(config, 'target_attribute', ''),
+            getattr(config, 'target_relation', ''),
+            split='test',
+        )
 
     ph, pw = ckpt['w'].shape[1], ckpt['w'].shape[2]
     patch  = AdversarialPatch(ph, pw, torch.device(device))
     patch.w.data.copy_(ckpt['w'])
     patch.eval()
 
-    dataset = EscaAttackDataset(
-        dataset_dir      = os.path.join(os.path.dirname(__file__), "dataset"),
-        dataset_filename = "gpt_specs2_id_LLaVA_all.jsonl",
-        target_category  = config.target_category,
-        target_attribute = config.target_attribute if config.attack_mode == 'attribute' else None,
-        split            = 'test',
-        max_clips        = getattr(config, 'max_clips', 0),
-    )
+    if getattr(config, 'sim_data_dir', ''):
+        from functions.attack.sim_data import SimAttackDataset
+        _only = [args.only_scenario] if getattr(args, 'only_scenario', '') else None
+        dataset = SimAttackDataset(
+            config.sim_data_dir,
+            target_category  = config.target_category if config.attack_mode != 'relation' else None,
+            target_attribute = config.target_attribute if config.attack_mode == 'attribute' else None,
+            target_relation  = config.target_relation if config.attack_mode == 'relation' else None,
+            split            = None if _only else 'test',
+            max_clips        = getattr(config, 'max_clips', 0),
+            only_scenarios   = _only,
+        )
+    else:
+        dataset = EscaAttackDataset(
+            dataset_dir      = os.path.join(os.path.dirname(__file__), "dataset"),
+            dataset_filename = "gpt_specs2_id_LLaVA_all.jsonl",
+            target_category  = config.target_category,
+            target_attribute = config.target_attribute if config.attack_mode == 'attribute' else None,
+            split            = 'test',
+            max_clips        = getattr(config, 'max_clips', 0),
+        )
 
     test_items = [dataset[i] for i in range(len(dataset))]
+
+    # Sim: score EACH frame as its own sample (more statistical power) rather than
+    # one selected frame per scenario.
+    if getattr(config, 'sim_data_dir', ''):
+        from functions.attack.sim_data import explode_to_frames
+        test_items = [fr for it in test_items for fr in explode_to_frames(it)]
+        # Relation eval re-scores EVERY object pair per frame (heavy); cap the
+        # frame-samples so it finishes. Category/attribute heads are cheap → keep all.
+        if config.attack_mode == 'relation' and len(test_items) > 150:
+            step = max(1, len(test_items) // 150)
+            test_items = test_items[::step]
+        print(f"  [sim] per-frame eval: {len(test_items)} frame-samples")
 
     n_loaded     = sum(1 for it in test_items if it is not None)
     total_frames = sum(len(it['frames']) for it in test_items if it is not None)
@@ -356,6 +393,12 @@ def main():
     parser.add_argument("--batch",    type=int,   default=8,     help="EoT batch size")
     parser.add_argument("--lr",       type=float, default=0.01,  help="Adam learning rate")
     parser.add_argument("--coverage", type=float, default=0.3,   help="Patch coverage ratio")
+    parser.add_argument("--lambda-c", type=float, default=1.0, dest="lambda_c",
+                        help="Chameleon camouflage weight (higher = blends more, weaker attack).")
+    parser.add_argument("--lambda-tv", type=float, default=1e-4, dest="lambda_tv",
+                        help="Smoothness (total-variation) weight (higher = smoother, less visible noise).")
+    parser.add_argument("--lambda-dino", type=float, default=0.5, dest="lambda_dino",
+                        help="DINOv2 semantic-camouflage weight.")
     parser.add_argument("--clip-size",type=int,   default=224,
                         dest="clip_size", help="CLIP input size (224 or 336)")
     parser.add_argument("--no-chameleon", action="store_false", dest="use_chameleon",
@@ -368,6 +411,16 @@ def main():
                         help="Min VINE softmax confidence for the target category to accept an "
                              "object as a target (0 = off). Drops weakly-classified targets "
                              "(e.g. a table VINE calls 'person' at 0.3). Try 0.5.")
+    parser.add_argument("--sim-data", default="", dest="sim_data",
+                        help="Train/eval on a SceneGraphBench (AI2-THOR) dataset at this path "
+                             "instead of the YouTube/ESCA dataset. No video download needed.")
+    parser.add_argument("--all-data", action="store_true", dest="all_data",
+                        help="Train on ALL sim scenarios (no train/test split).")
+    parser.add_argument("--init-patch", default="", dest="init_patch",
+                        help="Warm-start from this patch (.pt): reuse its anchor + weights and "
+                             "continue training (e.g. Phase-2 chameleon camouflage).")
+    parser.add_argument("--only-scenario", default="", dest="only_scenario",
+                        help="Restrict train/eval to a single sim scenario id (chameleon experiment).")
 
     # Eval
     parser.add_argument("--eval",  action="store_true", help="Run evaluation instead of training")

@@ -20,6 +20,11 @@ import torch
 from typing import List, Dict, Optional
 
 
+def _cat_ok(label: str, target: str, exact: bool) -> bool:
+    """Category match: exact word for sim ('pot' != 'potato'), substring for YouTube."""
+    return label.lower() == target.lower() if exact else target.lower() in label.lower()
+
+
 # ── shared helpers ────────────────────────────────────────────────────────────
 
 def _patch_object_across_frames(
@@ -172,6 +177,7 @@ def compute_flip_rate_across_clips(
     from functions.eval.scene_graph import predict_scene_graph
 
     all_results = []
+    _exact = bool(getattr(config, 'sim_data_dir', ''))
 
     for item in clip_items:
         if item is None:
@@ -188,8 +194,15 @@ def compute_flip_rate_across_clips(
         if config.attack_mode in ('category', 'attribute'):
             target_obj_ids = {
                 oid for oid, cat in sg_clean.categories.items()
-                if config.target_category.lower() in cat.lower()
+                if _cat_ok(cat, config.target_category, _exact)
             } if config.target_category else set(sg_clean.categories.keys())
+
+            # Sim: also require GROUND-TRUTH category == target, so the target is a
+            # REAL toaster — not an object VINE misreads as one (box on wrong object).
+            _gt = item.get('gt_categories')
+            if _gt is not None and config.target_category:
+                target_obj_ids = {oid for oid in target_obj_ids
+                                  if _cat_ok(_gt.get(oid, ''), config.target_category, _exact)}
 
             if config.attack_mode == 'attribute' and getattr(config, 'target_attribute', ''):
                 target_obj_ids = {
@@ -242,8 +255,12 @@ def compute_flip_rate_across_clips(
             if config.target_category:
                 target_pairs = {
                     p for p in target_pairs
-                    if config.target_category.lower() in sg_clean.categories.get(p[0], '').lower()
+                    if _cat_ok(sg_clean.categories.get(p[0], ''), config.target_category, _exact)
                 }
+                _gt = item.get('gt_categories')
+                if _gt is not None:
+                    target_pairs = {p for p in target_pairs
+                                    if _cat_ok(_gt.get(p[0], ''), config.target_category, _exact)}
 
             _min_conf = getattr(config, 'min_target_conf', 0.0)
             if _min_conf > 0:

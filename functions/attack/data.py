@@ -46,8 +46,22 @@ def _cached_frames(video_path: str, target_fps: int, max_vid_len: int):
     return raw  # list of HxWx3 uint8 numpy arrays (RGB)
 
 
+@lru_cache(maxsize=1024)
+def _cached_png(path: str):
+    """Load a single PNG frame (sim datasets store frames as PNGs, not videos)."""
+    from PIL import Image
+    return np.array(Image.open(path).convert('RGB'))   # HxWx3 uint8 RGB
+
+
 def load_frame(inst: dict) -> torch.Tensor:
-    """Lazy-load the frame for an instance as a float32 RGB tensor [H,W,3]."""
+    """Lazy-load the frame for an instance as a float32 RGB tensor [H,W,3].
+
+    Two sources: a sim PNG frame (inst['_png_path']) or a video clip
+    (inst['_video_path'] + frame index). Both yield RGB [H,W,3] float32, 0-255.
+    """
+    png = inst.get('_png_path')
+    if png:
+        return torch.from_numpy(_cached_png(png).astype(np.float32))
     frames = _cached_frames(inst['_video_path'], inst['_target_fps'], inst['_max_vid_len'])
     idx = min(inst['_frame_idx'], len(frames) - 1)
     return torch.from_numpy(frames[idx].astype(np.float32))

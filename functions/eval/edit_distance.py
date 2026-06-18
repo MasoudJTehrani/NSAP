@@ -121,6 +121,11 @@ def _match(label: str, target: str) -> bool:
     return target.lower() in label.lower()
 
 
+def _cat_ok(label: str, target: str, exact: bool) -> bool:
+    """Category match: exact word for sim ('pot' != 'potato'), substring for YouTube."""
+    return label.lower() == target.lower() if exact else target.lower() in label.lower()
+
+
 # ── utility (kept for external / testing use) ─────────────────────────────────
 
 def compute_edit_distance(
@@ -237,6 +242,7 @@ def evaluate_isolation(
     from functions.eval.scene_graph import predict_scene_graph
 
     all_edits = []
+    _exact = bool(getattr(config, 'sim_data_dir', ''))
 
     for item in clip_items:
         if item is None:
@@ -253,8 +259,14 @@ def evaluate_isolation(
         if config.attack_mode in ('category', 'attribute'):
             target_obj_ids = {
                 oid for oid, cat in sg_clean.categories.items()
-                if config.target_category.lower() in cat.lower()
+                if _cat_ok(cat, config.target_category, _exact)
             } if config.target_category else set(sg_clean.categories.keys())
+
+            # Sim: also require GROUND-TRUTH category == target (real object only).
+            _gt = item.get('gt_categories')
+            if _gt is not None and config.target_category:
+                target_obj_ids = {oid for oid in target_obj_ids
+                                  if _cat_ok(_gt.get(oid, ''), config.target_category, _exact)}
 
             if config.attack_mode == 'attribute' and getattr(config, 'target_attribute', ''):
                 target_obj_ids = {
@@ -309,8 +321,12 @@ def evaluate_isolation(
             if config.target_category:
                 target_pairs = {
                     p for p in target_pairs
-                    if config.target_category.lower() in sg_clean.categories.get(p[0], '').lower()
+                    if _cat_ok(sg_clean.categories.get(p[0], ''), config.target_category, _exact)
                 }
+                _gt = item.get('gt_categories')
+                if _gt is not None:
+                    target_pairs = {p for p in target_pairs
+                                    if _cat_ok(_gt.get(p[0], ''), config.target_category, _exact)}
 
             _min_conf = getattr(config, 'min_target_conf', 0.0)
             if _min_conf > 0:

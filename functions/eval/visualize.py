@@ -13,6 +13,11 @@ import torch
 from typing import List, Optional
 
 
+def _cat_ok(label: str, target: str, exact: bool) -> bool:
+    """Category match: exact word for sim ('pot' != 'potato'), substring for YouTube."""
+    return label.lower() == target.lower() if exact else target.lower() in label.lower()
+
+
 # ── helpers ──────────────────────────────────────────────────────────────────
 
 def _tensor_to_pil(frame: torch.Tensor):
@@ -137,6 +142,7 @@ def save_sample_images(
     target_category = config.target_category
     target_relation = getattr(config, 'target_relation', '')
     target_attribute = getattr(config, 'target_attribute', '')
+    _exact          = bool(getattr(config, 'sim_data_dir', ''))
 
     worked_list: list = []
     failed_list:  list = []
@@ -163,8 +169,14 @@ def save_sample_images(
             # Filter: category must match target_category
             target_obj_ids = {
                 oid for oid, cat in sg_clean.categories.items()
-                if target_category.lower() in cat.lower()
+                if _cat_ok(cat, target_category, _exact)
             }
+            # Sim: also require GROUND-TRUTH category == target, so the boxed object
+            # is the REAL target, not one VINE misreads as it.
+            _gt = item.get('gt_categories')
+            if _gt is not None and target_category:
+                target_obj_ids = {oid for oid in target_obj_ids
+                                  if _cat_ok(_gt.get(oid, ''), target_category, _exact)}
             # For attribute mode also require the clean attribute to match target_attribute
             if mode == 'attribute' and target_attribute:
                 target_obj_ids = {
@@ -247,8 +259,12 @@ def save_sample_images(
             if target_category:
                 target_pairs = {
                     p for p in target_pairs
-                    if target_category.lower() in sg_clean.categories.get(p[0], '').lower()
+                    if _cat_ok(sg_clean.categories.get(p[0], ''), target_category, _exact)
                 }
+                _gt = item.get('gt_categories')
+                if _gt is not None:
+                    target_pairs = {p for p in target_pairs
+                                    if _cat_ok(_gt.get(p[0], ''), target_category, _exact)}
 
             for pair in target_pairs:
                 subj_id = pair[0]
