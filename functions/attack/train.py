@@ -390,9 +390,12 @@ def train_patch(
             config.ref_gram_cache,
             f"{config.attack_mode}_{config.target_category}_gram.pt",
         )
-        _lazy_keys = ('_video_path', '_frame_idx', '_target_fps', '_max_vid_len')
+        # Carry _png_path too (sim frames are PNGs); .get so YouTube/sim instances
+        # that lack one key don't KeyError. Without _png_path, relation gram tried
+        # to load_frame via _video_path=None and crashed.
+        _lazy_keys = ('_video_path', '_frame_idx', '_target_fps', '_max_vid_len', '_png_path')
         gram_instances = instances if config.attack_mode != 'relation' else [
-            {**{k: i[k] for k in _lazy_keys}, 'mask': i['subj_mask'], 'bbox': i['subj_bbox']}
+            {**{k: i.get(k) for k in _lazy_keys}, 'mask': i['subj_mask'], 'bbox': i['subj_bbox']}
             for i in instances
         ]
         reference_grams = compute_reference_grams(

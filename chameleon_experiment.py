@@ -120,11 +120,14 @@ def main():
         slug = spec_slug(spec)
         print(f"\n\n##################### {slug} #####################", flush=True)
 
-        # Phase 1: universal (all data, no chameleon)
+        # Phase 1: universal (all data, no chameleon) — skip if already trained (resume)
         uni_dir = os.path.join(EXP, f"uni_{slug}")
-        run(spec_args(spec) + ["--sim-data", DATA, "--no-chameleon", "--batch", "2",
-                               "--all-data", "--steps", str(P1_STEPS), "--output-dir", uni_dir])
         uni_patch = os.path.join(uni_dir, slug, f"{slug}_final.pt")
+        if os.path.exists(uni_patch):
+            print(f"  (resume) reusing universal patch {uni_patch}")
+        else:
+            run(spec_args(spec) + ["--sim-data", DATA, "--no-chameleon", "--batch", "2",
+                                   "--all-data", "--steps", str(P1_STEPS), "--output-dir", uni_dir])
         if not os.path.exists(uni_patch):
             print(f"  ! {slug}: Phase-1 produced no patch (no clean instances); skipping.")
             summary.append((slug, 0, 0, 0, 0))
@@ -139,11 +142,12 @@ def main():
             loud_f += lf; loud_t += lt
 
             cham_dir = os.path.join(EXP, f"cham_{slug}_{sid}")
-            run(spec_args(spec) + ["--sim-data", DATA, "--batch", "1", "--init-patch", uni_patch,
-                                   "--only-scenario", sid, "--steps", str(P2_STEPS),
-                                   "--lambda-tv", LAMBDA_TV, "--lambda-c", LAMBDA_C,
-                                   "--output-dir", cham_dir])
             cham_patch = os.path.join(cham_dir, slug, f"{slug}_final.pt")
+            if not os.path.exists(cham_patch):   # skip training if already done (resume)
+                run(spec_args(spec) + ["--sim-data", DATA, "--batch", "1", "--init-patch", uni_patch,
+                                       "--only-scenario", sid, "--steps", str(P2_STEPS),
+                                       "--lambda-tv", LAMBDA_TV, "--lambda-c", LAMBDA_C,
+                                       "--output-dir", cham_dir])
             if os.path.exists(cham_patch):
                 run(["--eval", "--patch", cham_patch, "--only-scenario", sid])
                 hf, ht = read_flip(cham_patch)
