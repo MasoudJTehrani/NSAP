@@ -49,7 +49,7 @@ def make_planner(scene_graph_text, language_only):
         examples=laser_sg_examples_no_revert, scene_graph_examples=ev_mod.target_examples,
         n_shot=2, obs_key="head_rgb", chat_history=False, language_only=language_only,
         use_feedback=True, multistep=0, tp=1, scene_graph_text=scene_graph_text,
-        gd_only=False, top_k=1, aggr_thres=0.3, gd_box_threshold=0.1, gd_text_threshold=0.1,
+        gd_only=False, top_k=1, aggr_thres=0.4, gd_box_threshold=0.25, gd_text_threshold=0.2,
         use_sam2=False, gd_checkpoint_path=os.environ["NSAP_GD_CKPT"])
 
 
@@ -159,6 +159,8 @@ CONDS = {  # cond -> (scene_graph_text, language_only, inject)
     "base_benign": (False, False, False), "base_patch": (False, False, True),
     "esca_benign": (True, False, False),  "esca_patch": (True, False, True),
     "lang_benign": (True, True, False),   "lang_patch": (True, True, True),
+    # blind = no image AND no scene graph (instruction only) -> the perception floor
+    "blind_benign": (False, True, False), "blind_patch": (False, True, True),
 }
 
 
@@ -168,7 +170,10 @@ def main():
                     help="task id, comma list, or 'all'")
     ap.add_argument("--max-steps", type=int, default=14)
     ap.add_argument("--conditions", default="esca_benign,esca_patch,lang_benign,lang_patch")
+    ap.add_argument("--tasks-file", default="rung2/tasks.json")
     args = ap.parse_args()
+    global TASKS
+    TASKS = {t["id"]: t for t in json.load(open(args.tasks_file))["tasks"]}
     task_ids = list(TASKS) if args.task == "all" else args.task.split(",")
     conds = args.conditions.split(",")
     os.makedirs(f"{NSAP}/output/rung2", exist_ok=True)

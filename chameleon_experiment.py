@@ -29,6 +29,9 @@ P1_STEPS  = 1500
 P2_STEPS  = 600
 LAMBDA_TV = "1e-2"     # strong smoothing
 LAMBDA_C  = "3"        # strong camouflage
+EOT_CROPS = "4"        # Fix-B: jittered detector-like crops per step (live-loop transfer)
+COVERAGE  = "0.5"      # Fix-B: bigger patch so it dominates GroundingDINO's boxes
+FIXB      = ["--eot-crops", EOT_CROPS, "--coverage", COVERAGE]
 
 # (mode, target, attribute, relation)
 SPECS = [
@@ -126,8 +129,8 @@ def main():
         if os.path.exists(uni_patch):
             print(f"  (resume) reusing universal patch {uni_patch}")
         else:
-            run(spec_args(spec) + ["--sim-data", DATA, "--no-chameleon", "--batch", "2",
-                                   "--all-data", "--steps", str(P1_STEPS), "--output-dir", uni_dir])
+            run(spec_args(spec) + ["--sim-data", DATA, "--no-chameleon", "--batch", "1",
+                                   "--all-data", "--steps", str(P1_STEPS), "--output-dir", uni_dir] + FIXB)
         if not os.path.exists(uni_patch):
             print(f"  ! {slug}: Phase-1 produced no patch (no clean instances); skipping.")
             summary.append((slug, 0, 0, 0, 0))
@@ -147,7 +150,7 @@ def main():
                 run(spec_args(spec) + ["--sim-data", DATA, "--batch", "1", "--init-patch", uni_patch,
                                        "--only-scenario", sid, "--steps", str(P2_STEPS),
                                        "--lambda-tv", LAMBDA_TV, "--lambda-c", LAMBDA_C,
-                                       "--output-dir", cham_dir])
+                                       "--output-dir", cham_dir] + FIXB)
             if os.path.exists(cham_patch):
                 run(["--eval", "--patch", cham_patch, "--only-scenario", sid])
                 hf, ht = read_flip(cham_patch)

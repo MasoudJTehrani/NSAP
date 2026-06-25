@@ -135,6 +135,27 @@ def l_chameleon_tv(patch_pixels: torch.Tensor) -> torch.Tensor:
     return diff_h.pow(2).mean() + diff_w.pow(2).mean()
 
 
+def l_chameleon_content(patch_pixels: torch.Tensor, reference_crop: torch.Tensor) -> torch.Tensor:
+    """
+    Appearance/content anchor — pixel-space L2 between the patch and a real crop of
+    the target object (the object's appearance UNDER the patch footprint).
+
+    Unlike L_gram, which matches only VGG texture *statistics* (channel correlations)
+    and so leaves colour/structure free to drift into a rainbow, this term ties the
+    patch's actual pixels to the object, making it *look like* the object. Combined
+    with object-initialisation, this is what produces a genuinely hidden patch.
+    lambda_content is the explicit stealth↔flip knob: high → hidden but weaker flip,
+    low → strong flip but louder.
+
+    Both tensors are [H, W, 3] (or [3, H, W]) in [0, 255]; compared in [0, 1] space.
+    """
+    if patch_pixels.dim() == 3 and patch_pixels.shape[-1] == 3:
+        patch_pixels = patch_pixels.permute(2, 0, 1)        # [3, H, W]
+    if reference_crop.dim() == 3 and reference_crop.shape[-1] == 3:
+        reference_crop = reference_crop.permute(2, 0, 1)    # [3, H, W]
+    return torch.mean((patch_pixels / 255.0 - reference_crop / 255.0) ** 2)
+
+
 def l_chameleon_dino(
     patched_frame: torch.Tensor,
     patch_bbox: dict,
@@ -216,10 +237,12 @@ def total_loss(
     tv_loss: torch.Tensor,
     dino_loss: torch.Tensor,
     preserve_loss: torch.Tensor,
+    content_loss: Optional[torch.Tensor] = None,
     lambda_c: float = 1.0,
     lambda_tv: float = 1e-4,
     lambda_dino: float = 0.5,
     lambda_p: float = 0.5,
+    lambda_content: float = 0.0,
 ) -> torch.Tensor:
     """
     Objective minimised over the patch pixels w only (VINE is frozen), averaged
@@ -255,4 +278,9 @@ def total_loss(
     Defaults: λ_c=1.0, λ_tv=1e-4, λ_dino=0.5, λ_p=0.5, κ=0 (flip the top-1 label).
     """
     chameleon = gram_loss + lambda_tv * tv_loss + lambda_dino * dino_loss
-    return attack_loss + lambda_c * chameleon + lambda_p * preserve_loss
+    out = attack_loss + lambda_c * chameleon + lambda_p * preserve_loss
+    # Appearance anchor is a direct knob (not scaled by lambda_c): it must hold the
+    # patch close to the real object regardless of the texture-statistics weight.
+    if content_loss is not None and lambda_content > 0:
+        out = out + lambda_content * content_loss
+    return out

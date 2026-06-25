@@ -31,6 +31,11 @@ class AttackConfig:
     # Patch
     coverage_ratio: float = 0.3
     offset_range: float   = 0.1
+    # Fix-B: expectation over GroundingDINO-like crops. >0 also trains the patch to
+    # flip SGClip across jittered bbox crops (mimicking detector boxes), not just the
+    # full-frame view -> transfers to ESCA's live cropped multi-box detections.
+    eot_crops: int = 0
+    eot_scale_jitter: float = 0.3   # crop scale in [1-j, 1+j]; centre shift up to j*bbox
 
     # Optimizer
     learning_rate: float = 0.01
@@ -43,6 +48,15 @@ class AttackConfig:
     lambda_dino: float = 0.5
     lambda_p:    float = 0.5
     kappa:       float = 0.0
+
+    # Appearance/content camouflage (the genuine "hide it" mechanism):
+    #   object_init    — initialise the patch FROM a real crop of the target object
+    #                    (the object's appearance under the patch footprint) instead
+    #                    of a loud warm-start / random noise, so it STARTS hidden.
+    #   lambda_content — weight of the pixel-L2 anchor to that crop (stealth↔flip
+    #                    knob; 0 = off). Built whenever object_init OR lambda_content>0.
+    object_init:    bool  = False
+    lambda_content: float = 0.0
 
     # Reference Gram
     ref_gram_n: int = 500
@@ -219,6 +233,31 @@ def _get_clean_probs(
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Fix-B: Expectation-Over-Crops — mimic GroundingDINO detection boxes
+# ──────────────────────────────────────────────────────────────────────────────
+def _eot_crop_object(patched, mask, bbox, alpha, scale_jitter):
+    """Crop the patched frame to a JITTERED version of bbox (mimicking a detector
+    box: random scale + centre shift), whiten background -> a cropped object view.
+    Differentiable through the slice (grads flow to patch pixels inside the crop).
+    Returns None if the crop is degenerate."""
+    import random
+    from functions.attack.preprocess import extract_single_object_torch
+    H, W = patched.shape[0], patched.shape[1]
+    x1, y1, x2, y2 = bbox['x1'], bbox['y1'], bbox['x2'], bbox['y2']
+    bw, bh = max(1, x2 - x1), max(1, y2 - y1)
+    s = 1.0 + random.uniform(-scale_jitter, scale_jitter)
+    cx = (x1 + x2) / 2 + random.uniform(-scale_jitter, scale_jitter) * bw
+    cy = (y1 + y2) / 2 + random.uniform(-scale_jitter, scale_jitter) * bh
+    nx1 = int(max(0, cx - bw * s / 2)); ny1 = int(max(0, cy - bh * s / 2))
+    nx2 = int(min(W, cx + bw * s / 2)); ny2 = int(min(H, cy + bh * s / 2))
+    if nx2 - nx1 < 4 or ny2 - ny1 < 4:
+        return None
+    m = mask.squeeze(-1) if mask.dim() == 3 else mask
+    return extract_single_object_torch(patched[ny1:ny2, nx1:nx2, :],
+                                       m[ny1:ny2, nx1:nx2], alpha=alpha)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Training loop
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -246,7 +285,7 @@ def train_patch(
         compute_reference_grams, build_vgg_normalisation_tensors
     )
     from functions.attack.losses import (
-        l_attack_cw, l_chameleon_gram, l_chameleon_tv,
+        l_attack_cw, l_chameleon_gram, l_chameleon_tv, l_chameleon_content,
         l_chameleon_dino, l_preserve_kl, total_loss,
     )
     from functions.attack.preprocess import (
@@ -411,13 +450,47 @@ def train_patch(
         vgg_mean, vgg_std = build_vgg_normalisation_tensors(device)
 
     # ── Initialise patch and optimizer ───────────────────────────────────────
+    content_ref = None   # [ph, pw, 3] in [0,255]: the real object under the footprint
+
+    def _build_content_ref(ph_canon, pw_canon):
+        """Crop the target object's appearance UNDER the patch footprint from the
+        clearest (largest-bbox) instance, resized to the canonical patch size — the
+        'what should be here' image used for object-init and the L_content anchor."""
+        import torch.nn.functional as _F
+        def _area(i):
+            b = i['subj_bbox'] if config.attack_mode == 'relation' else i['bbox']
+            return (b['x2'] - b['x1']) * (b['y2'] - b['y1'])
+        ci = max(instances, key=_area)
+        cb = ci['subj_bbox'] if config.attack_mode == 'relation' else ci['bbox']
+        cframe = _load_frame(ci).to(device)                            # [H,W,3] in [0,255]
+        ih, iw = compute_patch_size(cb, config.coverage_ratio)
+        icx, icy = anchor_center(anchor, cb, ih, iw)
+        H, W = cframe.shape[:2]
+        x1 = max(0, icx - iw // 2); y1 = max(0, icy - ih // 2)
+        x2 = min(W, x1 + iw);       y2 = min(H, y1 + ih)
+        crop = cframe[y1:y2, x1:x2, :].permute(2, 0, 1).unsqueeze(0)   # [1,3,h,w]
+        crop = _F.interpolate(crop, size=(ph_canon, pw_canon), mode='bilinear', align_corners=False)
+        return crop.squeeze(0).permute(1, 2, 0).contiguous()          # [ph,pw,3] in [0,255]
+
+    def _object_init_w(ref_hwc):
+        """atanh-invert the object crop into the tanh-parameterised weights so the
+        patch STARTS visually equal to that crop (pixels = 127.5·(tanh(w)+1))."""
+        t = (ref_hwc.permute(2, 0, 1) / 127.5 - 1.0).clamp(-0.999, 0.999)
+        return torch.atanh(t)
+
     if _init_ckpt is not None:
-        # Warm-start: match the Phase-1 patch's canonical size and load its weights,
-        # so Phase 2 continues training the SAME patch (adding chameleon camouflage).
+        # Reuse the Phase-1 patch's canonical size + anchor. Pixels: object-init from
+        # the real object crop (hidden start), else loud warm-start (Phase-2 default).
         patch_h, patch_w = _init_ckpt['w'].shape[1], _init_ckpt['w'].shape[2]
         patch = AdversarialPatch(patch_h, patch_w, device)
-        patch.w.data.copy_(_init_ckpt['w'].to(device))
-        print(f"  Warm-started patch ({patch_h}x{patch_w}) from {config.init_patch_path}")
+        if config.object_init:
+            content_ref = _build_content_ref(patch_h, patch_w)
+            patch.w.data.copy_(_object_init_w(content_ref))
+            print(f"  Object-init patch ({patch_h}x{patch_w}) from real object crop "
+                  f"(anchor/size from {config.init_patch_path})")
+        else:
+            patch.w.data.copy_(_init_ckpt['w'].to(device))
+            print(f"  Warm-started patch ({patch_h}x{patch_w}) from {config.init_patch_path}")
     else:
         sample_bbox = (
             instances[0]['bbox'] if config.attack_mode != 'relation'
@@ -425,6 +498,15 @@ def train_patch(
         )
         patch_h, patch_w = compute_patch_size(sample_bbox, config.coverage_ratio)
         patch = AdversarialPatch(patch_h, patch_w, device)
+        if config.object_init:
+            content_ref = _build_content_ref(patch_h, patch_w)
+            patch.w.data.copy_(_object_init_w(content_ref))
+            print(f"  Object-init patch ({patch_h}x{patch_w}) from real object crop")
+
+    # Content anchor for the loss (built lazily if requested without object-init).
+    if config.lambda_content > 0 and content_ref is None:
+        content_ref = _build_content_ref(patch_h, patch_w)
+
     optimizer = optim.Adam(patch.parameters(), lr=config.learning_rate)
 
     os.makedirs(config.output_dir, exist_ok=True)
@@ -442,6 +524,7 @@ def train_patch(
         step_gram     = torch.tensor(0.0, device=device)
         step_tv       = torch.tensor(0.0, device=device)
         step_dino_l   = torch.tensor(0.0, device=device)
+        step_content  = torch.tensor(0.0, device=device)
         step_preserve = torch.tensor(0.0, device=device)
 
         for inst in batch:
@@ -536,7 +619,18 @@ def train_patch(
                 proc = extract_single_object_torch(patched, mask, alpha=vine_model.config.alpha)
 
                 scores = _clip_scores(vine_model, enc, proc, kws, device, config.clip_image_size)
-                step_attack = step_attack + l_attack_cw(scores, correct_idx, config.kappa)
+                attack_terms = [l_attack_cw(scores, correct_idx, config.kappa)]
+                # Fix-B EOT: also flip SGClip across jittered detector-like crops, so
+                # the patch transfers to ESCA's live GroundingDINO boxes (not just the
+                # full-frame view). Each crop is differentiable through the patch.
+                for _k in range(config.eot_crops):
+                    obj_k = _eot_crop_object(patched, mask, bbox, vine_model.config.alpha,
+                                             config.eot_scale_jitter)
+                    if obj_k is None:
+                        continue
+                    s_k = _clip_scores(vine_model, enc, obj_k, kws, device, config.clip_image_size)
+                    attack_terms.append(l_attack_cw(s_k, correct_idx, config.kappa))
+                step_attack = step_attack + torch.stack(attack_terms).mean()
 
                 # Preservation: the other two heads (same full-frame input)
                 preserve_heads = [
@@ -563,6 +657,11 @@ def train_patch(
                     dino_model, dino_preprocess_torch,
                 )
 
+            # Appearance/content anchor — independent of use_chameleon so object-init
+            # works even with the VGG/DINO naturalness regularisers off.
+            if config.lambda_content > 0 and content_ref is not None:
+                step_content = step_content + l_chameleon_content(patch.pixels_hwc, content_ref)
+
         n = len(batch)
         loss = total_loss(
             attack_loss   = step_attack   / n,
@@ -570,10 +669,12 @@ def train_patch(
             tv_loss       = step_tv       / n,
             dino_loss     = step_dino_l   / n,
             preserve_loss = step_preserve / n,
+            content_loss  = (step_content / n) if config.lambda_content > 0 else None,
             lambda_c      = config.lambda_c,
             lambda_tv     = config.lambda_tv,
             lambda_dino   = config.lambda_dino,
             lambda_p      = config.lambda_p,
+            lambda_content= config.lambda_content,
         )
 
         loss.backward()
@@ -586,6 +687,7 @@ def train_patch(
                 f"attack={step_attack.item()/n:.4f} | "
                 f"gram={step_gram.item()/n:.4f} | "
                 f"dino={step_dino_l.item()/n:.4f} | "
+                f"content={step_content.item()/n:.4f} | "
                 f"preserve={step_preserve.item()/n:.4f}"
             )
 

@@ -124,6 +124,7 @@ def run_train(args):
         target_relation  = args.relation,
         target_attribute = args.attribute,
         coverage_ratio   = args.coverage,
+        eot_crops        = args.eot_crops,
         num_steps        = args.steps,
         eot_batch_size   = args.batch,
         learning_rate    = args.lr,
@@ -140,6 +141,8 @@ def run_train(args):
         lambda_c         = args.lambda_c,
         lambda_tv        = args.lambda_tv,
         lambda_dino      = args.lambda_dino,
+        object_init      = args.object_init,
+        lambda_content   = args.lambda_content,
     )
 
     device     = args.device
@@ -393,12 +396,21 @@ def main():
     parser.add_argument("--batch",    type=int,   default=8,     help="EoT batch size")
     parser.add_argument("--lr",       type=float, default=0.01,  help="Adam learning rate")
     parser.add_argument("--coverage", type=float, default=0.3,   help="Patch coverage ratio")
+    parser.add_argument("--eot-crops", type=int, default=0, dest="eot_crops",
+                        help="Fix-B: # of jittered detector-like crops per step (0=off)")
     parser.add_argument("--lambda-c", type=float, default=1.0, dest="lambda_c",
                         help="Chameleon camouflage weight (higher = blends more, weaker attack).")
     parser.add_argument("--lambda-tv", type=float, default=1e-4, dest="lambda_tv",
                         help="Smoothness (total-variation) weight (higher = smoother, less visible noise).")
     parser.add_argument("--lambda-dino", type=float, default=0.5, dest="lambda_dino",
                         help="DINOv2 semantic-camouflage weight.")
+    parser.add_argument("--object-init", action="store_true", dest="object_init",
+                        help="Initialise the patch FROM a real crop of the target object "
+                             "(the object's appearance under the footprint) so it STARTS hidden, "
+                             "instead of a loud warm-start/random noise. Reuses --init-patch's anchor/size.")
+    parser.add_argument("--lambda-content", type=float, default=0.0, dest="lambda_content",
+                        help="Appearance anchor: pixel-L2 to the real object crop. The stealth↔flip "
+                             "knob (high=hidden/weaker flip, low=stronger flip/louder). 0=off.")
     parser.add_argument("--clip-size",type=int,   default=224,
                         dest="clip_size", help="CLIP input size (224 or 336)")
     parser.add_argument("--no-chameleon", action="store_false", dest="use_chameleon",

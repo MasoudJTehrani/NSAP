@@ -208,9 +208,10 @@ class Rung2Env:
         return False
 
     # ── perception target: face object + return frame, mask, bbox ────────────
-    def view_target(self, target_id, min_area=600, tries=8, seed=0):
+    def view_target(self, target_id, min_area=600, tries=8, seed=0, force_jitter=False):
         """Teleport to face the target object and return (frame_uint8, mask_bool, bbox)
-        from a viewpoint where it's adequately visible. Returns (None,None,None) if not."""
+        from a viewpoint where it's adequately visible. Returns (None,None,None) if not.
+        force_jitter=True jitters even the first pose (for distinct viewpoints per seed)."""
         import random
         obj = self.obj_by_id(target_id)
         if obj is None:
@@ -221,7 +222,7 @@ class Rung2Env:
         base_pos, base_yaw, base_hor = pose
         rng = random.Random(seed)
         for v in range(tries):
-            yaw, hor = (base_yaw, base_hor) if v == 0 else jitter(base_yaw, base_hor, rng)
+            yaw, hor = (base_yaw, base_hor) if (v == 0 and not force_jitter) else jitter(base_yaw, base_hor, rng)
             ev = self.c.step(action="TeleportFull", position=base_pos,
                              rotation=dict(x=0, y=yaw, z=0), horizon=hor, standing=True)
             m = ev.instance_masks.get(target_id)
