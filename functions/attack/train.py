@@ -647,18 +647,20 @@ def train_patch(
                                               bbox, pkws, device, config.clip_image_size)
                     step_preserve = step_preserve + l_preserve_kl(p_orig, p_pat)
 
-            # Chameleon losses (computed on the patch directly — not on the crop)
+            # Gram + DINO naturalness (need VGG16 / DINOv2 loaded)
             if config.use_chameleon:
                 patch_px = patch.pixels_hwc  # [H, W, 3]
                 step_gram   = step_gram   + l_chameleon_gram(patch_px, reference_grams, vgg, vgg_mean, vgg_std)
-                step_tv     = step_tv     + l_chameleon_tv(patch_px)
                 step_dino_l = step_dino_l + l_chameleon_dino(
                     patched, _patch_bbox_from_anchor(cx, cy, ph, pw, patched.shape),
                     dino_model, dino_preprocess_torch,
                 )
 
-            # Appearance/content anchor — independent of use_chameleon so object-init
-            # works even with the VGG/DINO naturalness regularisers off.
+            # TV smoothness + appearance/content anchor — network-free, so they run
+            # independent of use_chameleon (object-init camouflage = content [+ TV],
+            # without the VGG/DINO stack).
+            if config.lambda_tv > 0:
+                step_tv = step_tv + l_chameleon_tv(patch.pixels_hwc)
             if config.lambda_content > 0 and content_ref is not None:
                 step_content = step_content + l_chameleon_content(patch.pixels_hwc, content_ref)
 

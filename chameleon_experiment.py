@@ -4,9 +4,12 @@ Full per-scenario chameleon sweep across category / attribute / relation targets
 
 For each target:
   Phase 1 (loud):   train a universal patch on ALL its scenarios, NO chameleon.
-  Phase 2 (hidden): for N scenarios, WARM-START that patch and fine-tune the
-                    chameleon camouflage on ONLY that scenario (strong smoothing),
-                    so it blends into that exact kitchen's object.
+  Phase 2 (hidden): for N scenarios, OBJECT-INIT the patch from that scenario's real
+                    target crop (the object's appearance under the patch footprint) and
+                    re-optimise the attack under a pixel content anchor (lambda_content),
+                    so the patch keeps LOOKING like the object while still flipping it.
+                    Replaces the old gram/style camouflage, which only matched texture
+                    statistics and so produced a loud rainbow.
 
 Reports, per target, the aggregate per-frame flip rate of the loud universal patch
 vs the per-scenario chameleon patches. Saves hidden-patch sample images per scenario.
@@ -27,11 +30,12 @@ EXP  = os.path.join(ROOT, "output/chexp")
 N         = 3
 P1_STEPS  = 1500
 P2_STEPS  = 600
-LAMBDA_TV = "1e-2"     # strong smoothing
-LAMBDA_C  = "3"        # strong camouflage
+LAMBDA_CONTENT = "50"  # object-init appearance anchor (proven: 100% flip + hidden at cov 0.5)
 EOT_CROPS = "4"        # Fix-B: jittered detector-like crops per step (live-loop transfer)
 COVERAGE  = "0.5"      # Fix-B: bigger patch so it dominates GroundingDINO's boxes
-FIXB      = ["--eot-crops", EOT_CROPS, "--coverage", COVERAGE]
+# TV off: it costs a flip (erases the high-freq the attack needs) and leaks color into
+# an iridescent sheen. The content anchor alone keeps the patch looking like the object.
+FIXB      = ["--eot-crops", EOT_CROPS, "--coverage", COVERAGE, "--lambda-tv", "0"]
 
 # (mode, target, attribute, relation)
 SPECS = [
@@ -43,7 +47,8 @@ SPECS = [
     ("category",  "microwave",      "", ""),
     ("attribute", "fridge",         "open", ""),
     ("attribute", "microwave",      "open", ""),
-    ("attribute", "kettle",         "open", ""),
+    # kettle "open" dropped: the kettle is tiny and its lid open/closed state is
+    # ambiguous and irrelevant — the attack was meaningless (0% flip). Use fridge + microwave.
     ("relation",  "pot",            "", "on"),
     ("relation",  "toaster",        "", "on"),
     ("relation",  "coffee machine", "", "on"),
@@ -148,8 +153,8 @@ def main():
             cham_patch = os.path.join(cham_dir, slug, f"{slug}_final.pt")
             if not os.path.exists(cham_patch):   # skip training if already done (resume)
                 run(spec_args(spec) + ["--sim-data", DATA, "--batch", "1", "--init-patch", uni_patch,
+                                       "--object-init", "--no-chameleon", "--lambda-content", LAMBDA_CONTENT,
                                        "--only-scenario", sid, "--steps", str(P2_STEPS),
-                                       "--lambda-tv", LAMBDA_TV, "--lambda-c", LAMBDA_C,
                                        "--output-dir", cham_dir] + FIXB)
             if os.path.exists(cham_patch):
                 run(["--eval", "--patch", cham_patch, "--only-scenario", sid])

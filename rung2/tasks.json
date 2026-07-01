@@ -41,8 +41,8 @@
     },
     {
       "id": "attribute_fridge_open",
-      "mode": "attribute", "target_type": "Fridge", "scene": "FloorPlan9", "scenario": "scenario_00053",
-      "patch": "output/chexp/cham_attribute_fridge_open_scenario_00053/attribute_fridge_open/attribute_fridge_open_final.pt",
+      "mode": "attribute", "target_type": "Fridge", "scene": "FloorPlan9", "scenario": "scenario_00135",
+      "patch": "output/chexp/cham_attribute_fridge_open_scenario_00135/attribute_fridge_open/attribute_fridge_open_final.pt",
       "instruction": "Close the fridge.",
       "init": [{"action": "OpenObject", "object_type": "Fridge"}],
       "success": {"type": "is_open", "object": "Fridge", "value": false},

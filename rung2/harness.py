@@ -34,7 +34,13 @@ from embodiedbench.evaluator.config.system_prompts import alfred_laser_system_pr
 from alfred_examples import laser_sg_examples_no_revert
 import embodiedbench.evaluator.alfred.esca as ev_mod
 
-ACTIONS = get_global_action_space()
+ACTIONS = get_global_action_space() + [
+    # stock EB-ALFRED lacks actions for these targets; Rung2Env.execute already
+    # handles them, so expose them to the planner (else it falls back to action 0
+    # = "find a Cart" and loops). Needed for toaster / coffee-machine tasks.
+    "find a Toaster", "turn on the Toaster", "turn off the Toaster",
+    "turn on the CoffeeMachine", "turn off the CoffeeMachine",
+]
 TASKS = {t["id"]: t for t in json.load(open(f"{NSAP}/rung2/tasks.json"))["tasks"]}
 # RELATIVE path under cwd (=NSAP): ESCA's planner splits the image path on '/' and
 # os.path.join's it back to derive the bbox-viz path, which drops the leading slash
@@ -112,6 +118,7 @@ def run_episode(task, planner, inject, tag, max_steps=20):
     acted_on_target = False
     frames_with_patch = int(fl)
     trace = []
+    sg_log = []   # per decision: scene-graph text the planner saw + its own object list + action
     ttype = task["target_type"].lower()
     while steps < max_steps and not success:
         decision_frame = fn[0] - 1
@@ -121,6 +128,11 @@ def run_episode(task, planner, inject, tag, max_steps=20):
             import traceback as _tb; _tb.print_exc()
             trace.append(("PLANNER_ERROR", False, repr(e)[:80])); break
         save_planner_view(decision_frame)   # what the MLLM actually saw for this decision
+        _sgi = getattr(planner, "last_sg_info", {}) or {}
+        sg_log.append({"step": decision_frame,
+                       "scene_graph": getattr(planner, "last_sg_text", "") or "",
+                       "mllm_objects": _sgi.get("current_objects"),
+                       "action": action if isinstance(action, (str, list)) else str(action)})
         if action == -2:
             trace.append(("empty_plan", False, "")); break
         if action == -1:
@@ -146,7 +158,8 @@ def run_episode(task, planner, inject, tag, max_steps=20):
                 break
     env.stop()
     result = {"success": bool(success), "steps": steps, "acted_on_target": acted_on_target,
-              "frames_with_patch": frames_with_patch, "n_frames_saved": fn[0], "trace": trace}
+              "frames_with_patch": frames_with_patch, "n_frames_saved": fn[0], "trace": trace,
+              "sg_log": sg_log}
     json.dump({"task": task["id"], "instruction": instr, "condition": tag, **result},
               open(f"{ep_dir}/episode.json", "w"), indent=2, default=str)
     return result
