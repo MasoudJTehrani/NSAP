@@ -12,7 +12,7 @@ Two metrics per target, clean vs patched, averaged over N jittered viewpoints:
 Run: conda run -n embench python rung2/flip_rate.py --use-uni --n 6
 """
 import os, sys, json, argparse
-sys.path.insert(0, "/home/usi/NSAP/rung2")
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import numpy as np, torch
 from harness import make_planner, load_patch, ACTIONS, NSAP
 from env import Rung2Env

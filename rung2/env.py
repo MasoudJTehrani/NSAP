@@ -13,7 +13,7 @@ behavioral divergence we measure comes from the planner's *choice* of actions
 import os, sys
 import numpy as np
 
-NSAP = "/home/usi/NSAP"
+NSAP = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 for p in (NSAP, f"{NSAP}/SceneGraphBench"):
     if p not in sys.path:
         sys.path.insert(0, p)

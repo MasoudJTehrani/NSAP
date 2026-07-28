@@ -8,7 +8,7 @@ should be CLEAN (one entry per object). We want to see, per scenario:
 Run: conda run -n embench python rung2/debug_text.py --tasks category_fridge,category_pot,...
 """
 import os, sys, json, argparse
-sys.path.insert(0, "/home/usi/NSAP/rung2")
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import torch, numpy as np
 from PIL import Image
 from harness import make_planner, load_patch, ACTIONS, NSAP

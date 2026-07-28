@@ -13,7 +13,7 @@ Tests both the LOUD pot patch (most disruptive) and the hidden chameleon.
 conda run -n embench python rung2/mllm_probe.py
 """
 import os, sys, base64, io
-sys.path.insert(0, "/home/usi/NSAP/rung2")
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import numpy as np
 from PIL import Image
 from harness import load_patch, NSAP   # also sets OPENAI_API_KEY from ESCA/.openai_key

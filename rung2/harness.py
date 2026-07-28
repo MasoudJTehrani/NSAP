@@ -8,7 +8,8 @@ Run (embench env):
   conda run -n embench python rung2/harness.py --task category_fridge
 """
 import os, sys, json, argparse
-NSAP, ESCA = "/home/usi/NSAP", "/home/usi/ESCA"
+NSAP = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ESCA = os.environ.get("ESCA_ROOT", "/home/usi/ESCA")   # separate repo; override with $ESCA_ROOT
 for p in (ESCA, NSAP, f"{NSAP}/src/LASER", f"{NSAP}/src/LASER/laser/models",
           f"{ESCA}/embodiedbench/evaluator", f"{NSAP}/rung2", f"{NSAP}/SceneGraphBench"):
     if p not in sys.path:

@@ -16,7 +16,7 @@ This is the perception-resolution proof; the GT executor previously hid exactly 
 Run:  conda run -n embench python rung2/disambig.py
 """
 import os, sys
-sys.path.insert(0, "/home/usi/NSAP/rung2")
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import numpy as np
 from harness import make_planner, load_patch, ACTIONS, NSAP
 from env import Rung2Env

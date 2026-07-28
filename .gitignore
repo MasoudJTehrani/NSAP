@@ -1,3 +1,6 @@
+# Graphify
+
+graphify-out/
 # --- NSAP project ---
 # Dataset (annotations, masks, videos, frames — all large)
 dataset/
