@@ -2,10 +2,12 @@
 Rung-2 behavioral harness: ESCA's VLMPlanner (GroundingDINO + SGClip-with-our-heads
 + verified-SG prompt + gpt-4o-mini) drives a thin AI2-THOR-5.0 executor, with the
 FROZEN chameleon patch injected onto the target object every frame it's visible.
-Measures benign vs patched behavior under {base, esca, esca+language_only}.
+Measures benign vs patched behavior under {base, esca, lang, blind} x {benign, patch}.
 
-Run (embench env):
-  conda run -n embench python rung2/harness.py --task category_fridge
+Run in the `embench` env. NOTE: `conda run -n embench` can fail if CONDA_EXE is unset
+("__conda_exe: permission denied") -> call the env's python directly instead, e.g.
+  <miniconda>/envs/embench/bin/python rung2/harness.py --task all \
+      --tasks-file rung2/gap_tasks_v2.json --conditions base_benign,esca_benign,esca_patch
 """
 import os, sys, json, argparse
 NSAP = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -42,7 +44,7 @@ ACTIONS = get_global_action_space() + [
     "find a Toaster", "turn on the Toaster", "turn off the Toaster",
     "turn on the CoffeeMachine", "turn off the CoffeeMachine",
 ]
-TASKS = {t["id"]: t for t in json.load(open(f"{NSAP}/rung2/tasks.json"))["tasks"]}
+# TASKS is loaded in main() from --tasks-file (default rung2/tasks.json).
 # RELATIVE path under cwd (=NSAP): ESCA's planner splits the image path on '/' and
 # os.path.join's it back to derive the bbox-viz path, which drops the leading slash
 # on absolute paths. A relative path under an existing dir resolves correctly.
@@ -88,7 +90,7 @@ def render_inject(env, target_id, patch, save_copy=None):
     return TMP_IMG, flipped_here
 
 
-def run_episode(task, planner, inject, tag, max_steps=20):
+def run_episode(task, planner, inject, tag, max_steps=14):
     import shutil
     # per-episode folder: every observation frame + the annotated view the MLLM saw
     ep_dir = f"output/rung2/frames/{task['id']}__{tag}"
@@ -130,9 +132,15 @@ def run_episode(task, planner, inject, tag, max_steps=20):
             trace.append(("PLANNER_ERROR", False, repr(e)[:80])); break
         save_planner_view(decision_frame)   # what the MLLM actually saw for this decision
         _sgi = getattr(planner, "last_sg_info", {}) or {}
+        try:                       # _reason is the full MLLM plan JSON (esca.py act() line 2635)
+            _plan = json.loads(_reason)
+        except Exception:
+            _plan = _reason
         sg_log.append({"step": decision_frame,
                        "scene_graph": getattr(planner, "last_sg_text", "") or "",
                        "mllm_objects": _sgi.get("current_objects"),
+                       # full planner output: reasoning_and_reflection, language_plan, executable_plan, scene_graph
+                       "plan": _plan,
                        "action": action if isinstance(action, (str, list)) else str(action)})
         if action == -2:
             trace.append(("empty_plan", False, "")); break

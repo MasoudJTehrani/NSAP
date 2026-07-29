@@ -1,0 +1,4 @@
+[submodule "external/ESCA"]
+	path = external/ESCA
+	url = https://github.com/MasoudJTehrani/ESCA.git
+	branch = nsap
