@@ -5,15 +5,16 @@ Full Implementation Plan
 Date: 2026-05-18
 Author: Masoud J. Tehrani
 Model under attack: VINE / LASER (video-fm/vine, ICLR 2025)
-Dataset: ESCA-video-87K
+Dataset: SceneGraphBench (AI2-THOR sim; pixel-perfect GT masks/attributes/relations)
 
 
 --------------------------------------------------------------------------------
 1. PROJECT GOAL
 --------------------------------------------------------------------------------
-Design and implement a universal adversarial patch that disrupts VINE's video
-scene graph generation. The patch is trained once per target category and tested
-across multiple video clips. Three isolated attack modes are supported:
+Design and implement a universal adversarial patch that disrupts VINE's scene
+graph generation. The patch is trained once per target category and tested across
+multiple sim scenarios (AI2-THOR rendered frames). Three isolated attack modes
+are supported:
 
   (A) Category attack   — make VINE misclassify an object (e.g. table → not table)
   (B) Attribute attack  — make VINE assign the wrong attribute (e.g. red → not red)
@@ -75,7 +76,7 @@ gradients and will never be updated.
   stochastic offset (Phase 2).
 
   Phase 1 — SAM anchor selection (pre-training, done once per category):
-    1. Sample N=100 representative instances of the target category from ESCA.
+    1. Sample N=100 representative instances of the target category from the sim dataset.
     2. For each instance, run SAM [12] with a bounding-box prompt to obtain
        sub-region segmentation masks (e.g., for "person": head, torso, legs;
        for "car": windshield, hood, roof).
@@ -148,11 +149,11 @@ gradients and will never be updated.
   One patch tensor is trained per attack mode and per target category
   (e.g., one patch for attacking "person" category, a separate one for
   "cup" attribute). The same patch is applied to every instance of that
-  category across all videos during evaluation.
+  category across all sim scenarios during evaluation.
 
   This is the standard universal adversarial patch paradigm [1].
   During training, each gradient update is computed on a different instance
-  (different video, different frame), so the patch is forced to generalize rather
+  (different scenario, different frame), so the patch is forced to generalize rather
   than memorize one specific instance.
 
 3.3 Patch parameterization (tanh)
@@ -194,7 +195,7 @@ gradients and will never be updated.
 
 4.2 Expectation over Transformations (EoT)
   During each training step, the patch gradient is computed over a batch of K
-  frames sampled from different video clips containing instances of the target
+  frames sampled from different sim scenarios containing instances of the target
   category (K=8 default). The gradient is averaged over the batch before the
   Adam update.
 
@@ -222,7 +223,7 @@ gradients and will never be updated.
        k=20 groups for diversity-aware EoT sampling (Section 4.2).
 
   Precompute:
-    1. Collect N crops of the target category from ESCA (N=500 recommended).
+    1. Collect N crops of the target category from the sim dataset (N=500 recommended).
     2. For each crop, extract VGG16 [8] feature maps at layers relu1_2, relu2_2,
        relu3_3 and compute Gram matrices.
     3. Average the Gram matrices across all N crops → reference_gram (fixed for
@@ -230,7 +231,7 @@ gradients and will never be updated.
 
   Per training step:
     1. Sample a diverse mini-batch of (frame, mask, bbox, category_label) from
-       ESCA using diversity-aware EoT sampling, where the target category is
+       the sim dataset using diversity-aware EoT sampling, where the target category is
        present.
     2. Paste the current patch (derived from tanh(w)) at the SAM-selected anchor
        with a small random offset (±10% of patch size) for each instance.
@@ -367,19 +368,21 @@ All three terms are described below.
 --------------------------------------------------------------------------------
 
 6.1 Frame selection
-  VINE natively samples video at target_fps=1 with max_vid_len=10 (from
-  llava_dataset.py). For a 6-second clip → 6 frames; for a 15-second clip →
-  10 frames (further sub-sampled). Evaluation uses these exact same parameters
-  so results reflect real-world model behavior.
+  The sim dataset stores each scenario as a set of rendered frames (PNGs). To
+  mirror how ESCA queries VINE — one frame at a time — evaluation scores a SINGLE
+  frame per scenario: the one with the largest total object-mask area (objects
+  clearest), tie-broken by lowest frame id. The choice depends only on masks, so
+  the clean and patched passes always select the SAME frame
+  (functions/eval/scene_graph.py::select_eval_frame).
 
 6.2 Evaluation procedure
-  For each test video containing an instance of the target category:
+  For each test scenario containing an instance of the target category:
     1. Run VINE on the original frames → record baseline scene graph SG_clean.
     2. Apply the patch to every frame (same patch, same relative placement).
     3. Run VINE on the patched frames → record attacked scene graph SG_attacked.
     4. Compute metrics (see 6.3).
 
-  The test set should be held out from training — different video clips than
+  The test set should be held out from training — different sim scenarios than
   those used to compute the reference Gram or train the patch.
 
 6.3 Metrics
@@ -415,12 +418,12 @@ All three terms are described below.
 6.4 Baseline comparison (category attack only)
   Compare the universal patch from this work against patches from existing
   CLIP-based adversarial patch methods (AdvCLIP [6], SGA [7]) applied to the
-  same test clips under the same patch coverage budget. Metric: prediction flip
+  same test scenarios under the same patch coverage budget. Metric: prediction flip
   rate per frame across consecutive frames.
 
   The comparison argument: existing CLIP patches are designed for single images
   or i.i.d. pairs. The patch in this work is trained with EoT [3] over diverse
-  video instances and achieves more consistent flip rate across consecutive frames.
+  sim scenarios and achieves more consistent flip rate across the scenario's frames.
 
   Relation and attribute attacks are NOT compared to baselines as they are novel
   contributions (no known prior work attacks these specific heads of a
@@ -432,26 +435,28 @@ All three terms are described below.
 --------------------------------------------------------------------------------
 
 NSAP/
-├── NSAP.py                        entry point (existing)
+├── NSAP.py                        setup entry point (fetch model + SAM2)
+├── run_attack.py                  train / eval entry point (--sim-data <dir>)
 ├── functions/
-│   ├── download_esca_dataset.py   existing
-│   ├── download_videos.py         existing
-│   ├── extract_frames.py          existing
-│   ├── download_model.py          existing
+│   ├── download_model.py          fetch VINE weights + LASER source + SAM2
 │   ├── attack/
-│   │   ├── __init__.py
 │   │   ├── patch.py               patch tensor, tanh parameterization, paste logic
 │   │   ├── preprocess.py          differentiable PyTorch versions of
 │   │   │                          extract_single_object and extract_object_subject
-│   │   ├── losses.py              L_attack, L_chameleon (Gram+TV), L_preserve (KL)
+│   │   ├── anchor.py              SAM-guided patch-anchor selection
+│   │   ├── losses.py              L_attack, L_content/L_chameleon, L_preserve (KL)
 │   │   ├── train.py               training loop, EoT batching, Adam optimizer
-│   │   ├── reference_gram.py      precompute reference Gram from ESCA crops
-│   │   └── data.py                data loader: frames + masks + bboxes from ESCA
+│   │   ├── reference_gram.py      reference Gram from sim crops (legacy chameleon)
+│   │   ├── sim_data.py            SceneGraphBench (AI2-THOR) dataset loader
+│   │   └── data.py                shared frame/mask helpers (load_frame, ...)
 │   └── eval/
-│       ├── __init__.py
-│       ├── scene_graph.py         run VINE on a clip, return scene graph structure
+│       ├── scene_graph.py         run VINE on a frame, return scene graph structure
+│       ├── _common.py             shared target-match + patch-application helpers
 │       ├── flip_rate.py           compute per-head prediction flip rate
-│       └── edit_distance.py       compute scene graph edit distance
+│       ├── edit_distance.py       compute scene graph edit distance / isolation
+│       ├── visualize.py           save worked / failed sample images
+│       └── consistency_check.py   train-vs-eval forward parity guardrail
+├── SceneGraphBench/               AI2-THOR sim dataset generator (separate repo)
 └── NSAP_attack_plan.txt           this file
 
 
@@ -486,9 +491,8 @@ Loss weights:
   κ      (CW margin)       0.0
 
 Evaluation:
-  target_fps          1
-  max_vid_len         10
-  test_clips          held-out, not used in training or reference Gram computation
+  frame per scenario  largest-mask-area frame (scene_graph.select_eval_frame)
+  test scenarios      held-out, not used in training or reference Gram computation
 
 Attack modes:
   category            untargeted, white-box, suppress clip_cate_model top-1
@@ -542,11 +546,11 @@ Initial proposal → Final decision → Reason
    graph. White-box gradient flow to the patch requires differentiable PyTorch
    re-implementations of both functions.
 
-8. Training on extracted video frames → Training directly on ESCA masks
-   ESCA pre-computed masks (mini_LLaVA_10000_masks) already contain per-object
-   segmentation masks aligned with video frames. These can be used directly to
-   extract object crops for the reference Gram computation without re-running
-   GroundingDINO + SAM2.
+8. Extracted video frames + detector masks → Sim ground-truth masks
+   The SceneGraphBench (AI2-THOR) sim dataset ships pixel-perfect per-object
+   instance masks with each rendered frame, so object crops (for training and for
+   the reference Gram) come straight from ground truth — no GroundingDINO + SAM2
+   mask generation, and no over-segmentation to guess the target from.
 
 9. Fixed center placement → SAM-guided anchor selection
    Placing the patch at the geometric center of the bounding box is a heuristic

@@ -86,9 +86,9 @@ class AttackConfig:
     # category head (relation: the subject's category).
     min_target_conf: float = 0.0
 
-    # If set, train/eval on a SceneGraphBench (AI2-THOR) dataset at this path
-    # instead of the YouTube/ESCA dataset. Frames are PNGs and labels are sim
-    # ground truth (see functions/attack/sim_data.py::SimAttackDataset).
+    # Path to the SceneGraphBench (AI2-THOR) dataset to train/eval on — NSAP's
+    # data source. Frames are PNGs and labels are sim ground truth
+    # (see functions/attack/sim_data.py::SimAttackDataset). Required.
     sim_data_dir: str = ''
 
     # Two-phase chameleon experiment (sim only):
@@ -106,9 +106,11 @@ class AttackConfig:
     output_dir: str          = "output/patches"
     ref_gram_cache: str      = "output/reference_grams"
 
-    # Early stopping
-    early_stop_flip_rate: float = 0.9   # stop if flip rate exceeds this on val set
-    val_every: int              = 100
+    # Reproducibility: seed for the Python/NumPy/Torch RNGs used downstream
+    # (diversity mini-batch sampling + EoT positional/scale jitter), applied once
+    # at the start of train_patch. Bit-exact GPU determinism would additionally
+    # require torch.use_deterministic_algorithms(True).
+    seed: int = 0
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -263,8 +265,6 @@ def _eot_crop_object(patched, mask, bbox, alpha, scale_jitter):
 
 def train_patch(
     vine_model,
-    dataset_dir: str,
-    dataset_filename: str,
     config: AttackConfig,
     sam_predictor=None,
 ) -> 'AdversarialPatch':
@@ -273,12 +273,9 @@ def train_patch(
 
     Args:
         vine_model:       loaded VineModel (weights frozen — we only train the patch)
-        dataset_dir:      ESCA dataset root directory
-        dataset_filename: ESCA annotation filename
-        config:           AttackConfig dataclass
+        config:           AttackConfig dataclass (config.sim_data_dir names the dataset)
         sam_predictor:    SAM2ImagePredictor instance (None = use bbox center as anchor)
     """
-    from functions.attack.data import EscaAttackDataset
     from functions.attack.patch import AdversarialPatch, paste_patch, compute_patch_size
     from functions.attack.anchor import select_anchor, select_relation_anchor, anchor_center
     from functions.attack.reference_gram import (
@@ -299,6 +296,14 @@ def train_patch(
 
     device = next(vine_model.parameters()).device
 
+    # Reproducibility: seed every RNG the pipeline uses (diversity sampling, EoT
+    # jitter) so identical args reproduce identical runs.
+    _seed = int(getattr(config, 'seed', 0))
+    random.seed(_seed)
+    np.random.seed(_seed)
+    torch.manual_seed(_seed)
+    torch.cuda.manual_seed_all(_seed)
+
     # Freeze the VINE model — only the patch is trainable
     for p in vine_model.parameters():
         p.requires_grad_(False)
@@ -306,28 +311,23 @@ def train_patch(
 
     # ── Load dataset ──────────────────────────────────────────────────────────
     print(f"\n=== Loading dataset for {config.attack_mode} attack on '{config.target_category}' ===")
-    if getattr(config, 'sim_data_dir', ''):
-        from functions.attack.sim_data import SimAttackDataset
-        _only = [config.only_scenario] if getattr(config, 'only_scenario', '') else None
-        _split = None if (getattr(config, 'use_all_data', False) or _only) else 'train'
-        dataset = SimAttackDataset(
-            config.sim_data_dir,
-            target_category=config.target_category if config.attack_mode != 'relation' else None,
-            target_attribute=config.target_attribute if config.attack_mode == 'attribute' else None,
-            target_relation=config.target_relation if config.attack_mode == 'relation' else None,
-            split=_split,
-            max_clips=config.max_clips,
-            only_scenarios=_only,
+    if not getattr(config, 'sim_data_dir', ''):
+        raise ValueError(
+            "NSAP trains on the sim (SceneGraphBench) dataset only. "
+            "Pass --sim-data <dataset dir> (sets config.sim_data_dir)."
         )
-    else:
-        dataset = EscaAttackDataset(
-            dataset_dir=dataset_dir,
-            dataset_filename=dataset_filename,
-            target_category=config.target_category if config.attack_mode != 'relation' else None,
-            target_attribute=config.target_attribute if config.attack_mode == 'attribute' else None,
-            split='train',
-            max_clips=config.max_clips,
-        )
+    from functions.attack.sim_data import SimAttackDataset
+    _only = [config.only_scenario] if getattr(config, 'only_scenario', '') else None
+    _split = None if (getattr(config, 'use_all_data', False) or _only) else 'train'
+    dataset = SimAttackDataset(
+        config.sim_data_dir,
+        target_category=config.target_category if config.attack_mode != 'relation' else None,
+        target_attribute=config.target_attribute if config.attack_mode == 'attribute' else None,
+        target_relation=config.target_relation if config.attack_mode == 'relation' else None,
+        split=_split,
+        max_clips=config.max_clips,
+        only_scenarios=_only,
+    )
 
     if config.attack_mode == 'relation':
         instances = dataset.build_relation_instance_list(
@@ -429,12 +429,10 @@ def train_patch(
             config.ref_gram_cache,
             f"{config.attack_mode}_{config.target_category}_gram.pt",
         )
-        # Carry _png_path too (sim frames are PNGs); .get so YouTube/sim instances
-        # that lack one key don't KeyError. Without _png_path, relation gram tried
-        # to load_frame via _video_path=None and crashed.
-        _lazy_keys = ('_video_path', '_frame_idx', '_target_fps', '_max_vid_len', '_png_path')
+        # Relation gram-instances need the frame path plus the subject mask/bbox;
+        # load_frame reads only _png_path (.get in case it's ever absent).
         gram_instances = instances if config.attack_mode != 'relation' else [
-            {**{k: i.get(k) for k in _lazy_keys}, 'mask': i['subj_mask'], 'bbox': i['subj_bbox']}
+            {'_png_path': i.get('_png_path'), 'mask': i['subj_mask'], 'bbox': i['subj_bbox']}
             for i in instances
         ]
         reference_grams = compute_reference_grams(
@@ -581,7 +579,7 @@ def train_patch(
                     proc_p = extract_single_object_torch(patched, subj_mask, alpha=vine_model.config.alpha)
                     s_pat  = _clip_scores(vine_model, enc, proc_p, kws, device, config.clip_image_size)
                     p_pat  = torch.softmax(s_pat, dim=-1)
-                    p_orig = _get_clean_probs(vine_model, enc, _load_frame(inst), inst['subj_mask'],
+                    p_orig = _get_clean_probs(vine_model, enc, frame, inst['subj_mask'],
                                               subj_bbox, kws, device, config.clip_image_size)
                     step_preserve = step_preserve + l_preserve_kl(p_orig, p_pat)
 
@@ -643,7 +641,7 @@ def train_patch(
                         continue
                     s_pat  = _clip_scores(vine_model, penc, proc, pkws, device, config.clip_image_size)
                     p_pat  = torch.softmax(s_pat, dim=-1)
-                    p_orig = _get_clean_probs(vine_model, penc, _load_frame(inst), inst['mask'],
+                    p_orig = _get_clean_probs(vine_model, penc, frame, inst['mask'],
                                               bbox, pkws, device, config.clip_image_size)
                     step_preserve = step_preserve + l_preserve_kl(p_orig, p_pat)
 
@@ -747,14 +745,13 @@ def _filter_by_clean_prediction(
         crop_image_contain_bboxes_torch,
     )
 
-    _sim = bool(getattr(config, 'sim_data_dir', ''))
-
     def _head_top1_ok(enc, proc_img, kws, target, min_conf: float = 0.0,
                       exact: bool = False) -> bool:
         """
         True if `target` is empty (no gate), or VINE's top-1 over `kws` matches
-        `target` — EXACT word when `exact` (sim categories: 'pot' != 'potato'),
-        else substring (YouTube: 'stand' ⊂ 'standing') — AND prob >= min_conf.
+        `target` — EXACT word when `exact` (categories: 'pot' != 'potato'),
+        else substring (attribute keywords: target 'open' ⊂ predicted 'opened')
+        — AND prob >= min_conf.
         """
         if not target:
             return True
@@ -770,6 +767,7 @@ def _filter_by_clean_prediction(
         return float(probs[i].item()) >= min_conf
 
     kept = []
+    n_err = 0
     for inst in instances:
         frame  = _load_frame(inst).to(device)
         spec   = inst['gpt_spec']
@@ -784,13 +782,13 @@ def _filter_by_clean_prediction(
                 if config.attack_mode == 'category':
                     ok = _head_top1_ok(vine_model.clip_cate_model, proc, consts,
                                        config.target_category, min_conf=config.min_target_conf,
-                                       exact=_sim)
+                                       exact=True)
                 else:
                     # attribute: require BOTH the target category (confidently) AND the attribute
                     ok = (
                         _head_top1_ok(vine_model.clip_cate_model,  proc, consts,
                                       config.target_category, min_conf=config.min_target_conf,
-                                      exact=_sim)
+                                      exact=True)
                         and
                         _head_top1_ok(vine_model.clip_unary_model, proc, spec.get('unary_kws', []),
                                       config.target_attribute)
@@ -806,7 +804,7 @@ def _filter_by_clean_prediction(
                 proc_subj = extract_single_object_torch(frame, subj_mask, alpha=vine_model.config.alpha)
                 if not _head_top1_ok(vine_model.clip_cate_model, proc_subj, consts,
                                      config.target_category, min_conf=config.min_target_conf,
-                                     exact=_sim):
+                                     exact=True):
                     continue
 
                 # relation gate — subject+object crop, as eval classifies the relation
@@ -821,9 +819,15 @@ def _filter_by_clean_prediction(
             if ok:
                 kept.append(inst)
 
-        except Exception:
+        except Exception as e:
+            n_err += 1
+            if n_err <= 3:
+                print(f"  [filter] instance dropped by error: {type(e).__name__}: {e}")
             continue
 
+    if n_err:
+        print(f"  [filter] {n_err} instance(s) dropped due to errors (first 3 shown). "
+              f"If ALL instances were dropped this is likely a code bug, not VINE.")
     return kept
 
 

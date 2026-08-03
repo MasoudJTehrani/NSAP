@@ -22,6 +22,22 @@ class SceneGraph:
     relations: Dict[Tuple[int,int], str] = field(default_factory=dict)
 
 
+def select_eval_frame(masks, n_frames, require_obj=None):
+    """The single frame predict_scene_graph scores: the one with the largest total
+    mask area (objects clearest), tie-broken by lowest frame id. A pure function of
+    masks, so the clean and patched passes always agree.
+
+    If require_obj is given, restrict to frames whose masks contain that object id
+    (used by visualize so the displayed frame actually holds the target). Returns
+    None if there is no valid frame.
+    """
+    valid = [fid for fid in masks
+             if fid < n_frames and (require_obj is None or require_obj in masks[fid])]
+    if not valid:
+        return None
+    return max(valid, key=lambda fid: (sum(int(m.sum()) for m in masks[fid].values()), -fid))
+
+
 def predict_scene_graph(
     vine_model,
     frames: List[torch.Tensor],
@@ -66,12 +82,8 @@ def predict_scene_graph(
     # (objects clearest), tie-broken by lowest frame_id. The choice depends only
     # on masks, so the clean and patched passes always select the SAME frame.
     if single_frame and len(masks) > 0:
-        valid_fids = [fid for fid in masks if fid < len(frames)]
-        if valid_fids:
-            sel = max(
-                valid_fids,
-                key=lambda fid: (sum(int(m.sum()) for m in masks[fid].values()), -fid),
-            )
+        sel = select_eval_frame(masks, len(frames))
+        if sel is not None:
             frames = [frames[sel]]
             masks  = {0: masks[sel]}
             bboxes = {0: bboxes.get(sel, {})}

@@ -107,6 +107,24 @@ def anchor_center(
     return cx, cy
 
 
+def _anchor_warmup_loss(sample_bbox, coverage_ratio, warmup_steps, device, batch_loss) -> float:
+    """Shared anchor warmup: init a fresh patch sized to `sample_bbox`, run `warmup_steps`
+    Adam steps minimising `batch_loss(patch)` (mean CW over the eval instances at a fixed
+    anchor), and return the final mean CW. Lower = better anchor. Used by both the
+    category/attribute (`_evaluate_anchor`) and relation (`select_relation_anchor`) paths."""
+    from functions.attack.patch import AdversarialPatch, compute_patch_size
+    patch_h, patch_w = compute_patch_size(sample_bbox, coverage_ratio)
+    patch = AdversarialPatch(patch_h, patch_w, device)
+    optimizer = optim.Adam(patch.parameters(), lr=0.01)
+    last = torch.tensor(float('inf'), device=device)
+    for _ in range(warmup_steps):
+        optimizer.zero_grad()
+        last = batch_loss(patch)
+        last.backward()
+        optimizer.step()
+    return float(last.item())
+
+
 def _evaluate_anchor(
     anchor_dx: int,
     anchor_dy: int,
@@ -126,7 +144,7 @@ def _evaluate_anchor(
     warmup_steps gradient steps and returning the final average CW loss.
     Lower returned loss = better anchor.
     """
-    from functions.attack.patch import AdversarialPatch, paste_patch, compute_patch_size
+    from functions.attack.patch import paste_patch, compute_patch_size
     from functions.attack.preprocess import (
         clip_scores,
         extract_single_object_torch,
@@ -157,40 +175,25 @@ def _evaluate_anchor(
         # skip warmup and return 0 (all anchors are equivalent).
         return 0.0
 
-    sample_bbox = cw_eval_instances[0][0]['bbox']
-    patch_h, patch_w = compute_patch_size(sample_bbox, coverage_ratio)
-    patch = AdversarialPatch(patch_h, patch_w, device)
-    optimizer = optim.Adam(patch.parameters(), lr=0.01)
-
-    for _ in range(warmup_steps):
-        total     = torch.tensor(0.0, device=device)
-        n_counted = 0
-        optimizer.zero_grad()
-
+    def batch_loss(patch):
+        total = torch.tensor(0.0, device=device)
         for inst, inst_kws, inst_correct_idx in cw_eval_instances:
-
             frame = _load_frame(inst).to(device)
             mask  = inst['mask'].to(device)
             bbox  = inst['bbox']
             ph, pw = compute_patch_size(bbox, coverage_ratio)
-
             # Place exactly as paste-time does (inset clamp keeps the whole patch
             # inside the bbox), so the anchor is selected under the real placement.
             cx, cy = anchor_center(Anchor(anchor_dx, anchor_dy, ''), bbox, ph, pw)
-
             patched = paste_patch(frame, patch.pixels_hwc, cx, cy, ph, pw)
-
             # category/attribute: eval classifies on the FULL frame (no bbox crop)
             proc   = extract_single_object_torch(patched, mask, alpha=vine_model.config.alpha)
             scores = clip_scores(vine_model, clip_encoder, proc, inst_kws, device, clip_image_size)
+            total  = total + l_attack_cw(scores, inst_correct_idx)
+        return total / len(cw_eval_instances)
 
-            total     = total + l_attack_cw(scores, inst_correct_idx)
-            n_counted += 1
-
-        (total / n_counted).backward()
-        optimizer.step()
-
-    return total.item() / n_counted
+    return _anchor_warmup_loss(cw_eval_instances[0][0]['bbox'], coverage_ratio,
+                               warmup_steps, device, batch_loss)
 
 
 def select_anchor(
@@ -304,7 +307,7 @@ def select_relation_anchor(
     if not candidates:
         candidates = [(0, 0)]
 
-    from functions.attack.patch import AdversarialPatch, paste_patch, compute_patch_size
+    from functions.attack.patch import paste_patch, compute_patch_size
     from functions.attack.preprocess import (
         clip_scores,
         extract_object_subject_torch,
@@ -325,14 +328,8 @@ def select_relation_anchor(
     print(f"Evaluating {len(candidates)} relation anchor candidates...")
 
     for idx, (dx, dy) in enumerate(candidates):
-        sample_bbox = eval_subset[0]['subj_bbox']
-        patch_h, patch_w = compute_patch_size(sample_bbox, coverage_ratio)
-        patch     = AdversarialPatch(patch_h, patch_w, device)
-        optimizer = optim.Adam(patch.parameters(), lr=0.01)
-
-        for _ in range(warmup_steps):
+        def batch_loss(patch, dx=dx, dy=dy):
             total = torch.tensor(0.0, device=device)
-            optimizer.zero_grad()
             for inst in eval_subset[:20]:
                 frame      = _load_frame(inst).to(device)
                 subj_mask  = inst['subj_mask'].to(device)
@@ -340,10 +337,8 @@ def select_relation_anchor(
                 subj_bbox  = inst['subj_bbox']
                 obj_bbox   = inst['obj_bbox']
                 ph, pw     = compute_patch_size(subj_bbox, coverage_ratio)
-
                 # Match paste-time placement (inset clamp) during selection too.
                 cx, cy = anchor_center(Anchor(dx, dy, ''), subj_bbox, ph, pw)
-
                 patched = paste_patch(frame, patch.pixels_hwc, cx, cy, ph, pw)
                 # relation: eval crops to the union of subject+object bboxes
                 proc    = extract_object_subject_torch(
@@ -353,12 +348,11 @@ def select_relation_anchor(
                 crop    = crop_image_contain_bboxes_torch(proc, [subj_bbox, obj_bbox])
                 scores  = clip_scores(vine_model, vine_model.clip_binary_model,
                                       crop, binary_kws, device, clip_image_size)
-                total  = total + l_attack_cw(scores, correct_idx)
+                total   = total + l_attack_cw(scores, correct_idx)
+            return total / len(eval_subset[:20])
 
-            (total / len(eval_subset[:20])).backward()
-            optimizer.step()
-
-        loss_val = total.item() / len(eval_subset[:20])
+        loss_val = _anchor_warmup_loss(eval_subset[0]['subj_bbox'], coverage_ratio,
+                                       warmup_steps, device, batch_loss)
         print(f"  candidate {idx} (dx={dx}, dy={dy}): warmup loss = {loss_val:.4f}")
         if loss_val < best_loss:
             best_loss  = loss_val

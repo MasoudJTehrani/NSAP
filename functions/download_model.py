@@ -9,9 +9,10 @@ The vine source files (vine_model.py, vine_pipeline.py, vine_config.py) ship
 directly inside the HF repo, so no separate vine_hf package clone is needed.
 They are registered via a .pth file so they are importable as top-level modules.
 
-GroundingDINO + SAM2 are NOT downloaded by default — we use pre-computed masks
-from the dataset, so the detection frontend is not needed for adversarial attacks.
-Pass include_detection=True to download them anyway.
+SAM2 is required (anchor sub-region selection during training) and is fetched
+separately by NSAP.py via download_sam2(). GroundingDINO is optional — the sim
+dataset ships ground-truth masks, so the detection frontend is not needed for the
+attack itself; pass include_detection=True to fetch it anyway.
 """
 
 import os
@@ -91,7 +92,12 @@ def _register_vine_source() -> None:
     init_file = MODEL_DIR / "__init__.py"
     init_file.touch(exist_ok=True)
 
-    site_dir = Path(site.getsitepackages()[0])
+    # site.getsitepackages() is missing in some virtualenvs — fall back to sysconfig.
+    try:
+        site_dir = Path(site.getsitepackages()[0])
+    except (AttributeError, IndexError):
+        import sysconfig
+        site_dir = Path(sysconfig.get_path("purelib"))
     pth = site_dir / "vine_source.pth"
     if pth.exists() and pth.read_text().strip() == package_root:
         print("  vine source already registered.")
@@ -112,7 +118,19 @@ def _download_file(url: str, dest: Path) -> None:
         return
     print(f"  Downloading {dest.name} ...")
     dest.parent.mkdir(parents=True, exist_ok=True)
-    _run(["wget", "-q", "-O", str(dest), url])
+    # stdlib download (portable — no wget/curl dependency); write to a .part temp
+    # then atomically rename so an interrupted download can't leave a corrupt file
+    # that the idempotent existence check above would later skip.
+    import urllib.request
+    tmp = dest.with_suffix(dest.suffix + ".part")
+    try:
+        urllib.request.urlretrieve(url, tmp)
+        tmp.replace(dest)
+    except Exception as e:
+        if tmp.exists():
+            tmp.unlink()
+        print(f"  Download failed: {e}")
+        sys.exit(1)
     print(f"  Saved: {dest.name}")
 
 

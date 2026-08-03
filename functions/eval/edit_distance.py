@@ -15,44 +15,10 @@ Per-object rates are normalised by n_target_objects so they are comparable
 across clips regardless of how many objects the clip contains.
 """
 
-import torch
 from typing import Dict, Tuple
 from dataclasses import dataclass, field
 from functions.eval.scene_graph import SceneGraph
-
-
-# ── shared helper ─────────────────────────────────────────────────────────────
-
-def _patch_object_across_frames(
-    clean_frames: list,
-    bboxes: dict,
-    patch,
-    anchor,
-    config,
-    device: torch.device,
-    obj_id: int,
-) -> list:
-    """
-    Return a copy of clean_frames with the patch applied only to obj_id
-    in every frame where that object appears.
-    """
-    from functions.attack.patch import paste_patch, compute_patch_size
-    from functions.attack.anchor import anchor_center
-
-    patched = []
-    for frame_id, frame in enumerate(clean_frames):
-        frame_bboxes = bboxes.get(frame_id, {})
-        if obj_id in frame_bboxes:
-            bbox   = frame_bboxes[obj_id]
-            ph, pw = compute_patch_size(bbox, config.coverage_ratio)
-            cx, cy = anchor_center(anchor, bbox, ph, pw)
-            f = paste_patch(
-                frame.clone().to(device), patch.pixels_hwc, cx, cy, ph, pw,
-            ).cpu()
-        else:
-            f = frame
-        patched.append(f)
-    return patched
+from functions.eval._common import _cat_ok, _patch_object_across_frames
 
 
 # ── result dataclass ──────────────────────────────────────────────────────────
@@ -117,101 +83,6 @@ class EditDistanceResult:
         return 0.0
 
 
-def _match(label: str, target: str) -> bool:
-    return target.lower() in label.lower()
-
-
-def _cat_ok(label: str, target: str, exact: bool) -> bool:
-    """Category match: exact word for sim ('pot' != 'potato'), substring for YouTube."""
-    return label.lower() == target.lower() if exact else target.lower() in label.lower()
-
-
-# ── utility (kept for external / testing use) ─────────────────────────────────
-
-def compute_edit_distance(
-    sg_clean: SceneGraph,
-    sg_attacked: SceneGraph,
-    attack_mode: str = 'category',
-    target_category: str = '',
-    target_relation: str = '',
-    target_attribute: str = '',
-) -> EditDistanceResult:
-    """
-    Compute edit distance restricted to the target object(s) given two
-    pre-computed scene graphs.
-
-    NOTE: the caller is responsible for ensuring sg_attacked was produced
-    with the correct patching strategy.  For batch evaluation use
-    evaluate_isolation() instead.
-    """
-    result = EditDistanceResult()
-
-    if attack_mode in ('category', 'attribute'):
-        target_obj_ids = {
-            obj_id for obj_id, cat in sg_clean.categories.items()
-            if _match(cat, target_category)
-        } if target_category else set(sg_clean.categories.keys())
-
-        if attack_mode == 'attribute' and target_attribute:
-            target_obj_ids = {
-                obj_id for obj_id in target_obj_ids
-                if _match(sg_clean.attributes.get(obj_id, ''), target_attribute)
-            }
-
-        result.n_target_objects = len(target_obj_ids)
-        attacked_obj_ids = set(sg_attacked.categories.keys())
-        result.target_disappeared = len(target_obj_ids - attacked_obj_ids)
-
-        for obj_id in target_obj_ids & attacked_obj_ids:
-            clean_cat    = sg_clean.categories.get(obj_id)
-            attacked_cat = sg_attacked.categories.get(obj_id)
-            if clean_cat and attacked_cat and clean_cat != attacked_cat:
-                result.category_changes += 1
-
-            clean_attr    = sg_clean.attributes.get(obj_id)
-            attacked_attr = sg_attacked.attributes.get(obj_id)
-            if clean_attr and attacked_attr and clean_attr != attacked_attr:
-                result.attribute_changes += 1
-
-    elif attack_mode == 'relation':
-        target_pairs = {
-            pair for pair, rel in sg_clean.relations.items()
-            if _match(rel, target_relation)
-        } if target_relation else set(sg_clean.relations.keys())
-
-        if target_category:
-            target_pairs = {
-                pair for pair in target_pairs
-                if _match(sg_clean.categories.get(pair[0], ''), target_category)
-            }
-
-        result.n_target_relations = len(target_pairs)
-        target_obj_ids = {pair[0] for pair in target_pairs}
-        result.n_target_objects = len(target_obj_ids)
-
-        attacked_obj_ids = set(sg_attacked.categories.keys())
-        result.target_disappeared = len(target_obj_ids - attacked_obj_ids)
-
-        for pair in target_pairs:
-            clean_rel    = sg_clean.relations.get(pair)
-            attacked_rel = sg_attacked.relations.get(pair)
-            if clean_rel and attacked_rel and clean_rel != attacked_rel:
-                result.relation_changes += 1
-
-        for obj_id in target_obj_ids & attacked_obj_ids:
-            clean_cat    = sg_clean.categories.get(obj_id)
-            attacked_cat = sg_attacked.categories.get(obj_id)
-            if clean_cat and attacked_cat and clean_cat != attacked_cat:
-                result.category_changes += 1
-
-            clean_attr    = sg_clean.attributes.get(obj_id)
-            attacked_attr = sg_attacked.attributes.get(obj_id)
-            if clean_attr and attacked_attr and clean_attr != attacked_attr:
-                result.attribute_changes += 1
-
-    return result
-
-
 # ── main evaluation entry point ───────────────────────────────────────────────
 
 def evaluate_isolation(
@@ -242,7 +113,6 @@ def evaluate_isolation(
     from functions.eval.scene_graph import predict_scene_graph
 
     all_edits = []
-    _exact = bool(getattr(config, 'sim_data_dir', ''))
 
     for item in clip_items:
         if item is None:
@@ -259,14 +129,14 @@ def evaluate_isolation(
         if config.attack_mode in ('category', 'attribute'):
             target_obj_ids = {
                 oid for oid, cat in sg_clean.categories.items()
-                if _cat_ok(cat, config.target_category, _exact)
+                if _cat_ok(cat, config.target_category)
             } if config.target_category else set(sg_clean.categories.keys())
 
             # Sim: also require GROUND-TRUTH category == target (real object only).
             _gt = item.get('gt_categories')
             if _gt is not None and config.target_category:
                 target_obj_ids = {oid for oid in target_obj_ids
-                                  if _cat_ok(_gt.get(oid, ''), config.target_category, _exact)}
+                                  if _cat_ok(_gt.get(oid, ''), config.target_category)}
 
             if config.attack_mode == 'attribute' and getattr(config, 'target_attribute', ''):
                 target_obj_ids = {
@@ -321,12 +191,12 @@ def evaluate_isolation(
             if config.target_category:
                 target_pairs = {
                     p for p in target_pairs
-                    if _cat_ok(sg_clean.categories.get(p[0], ''), config.target_category, _exact)
+                    if _cat_ok(sg_clean.categories.get(p[0], ''), config.target_category)
                 }
                 _gt = item.get('gt_categories')
                 if _gt is not None:
                     target_pairs = {p for p in target_pairs
-                                    if _cat_ok(_gt.get(p[0], ''), config.target_category, _exact)}
+                                    if _cat_ok(_gt.get(p[0], ''), config.target_category)}
 
             _min_conf = getattr(config, 'min_target_conf', 0.0)
             if _min_conf > 0:

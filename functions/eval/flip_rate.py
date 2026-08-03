@@ -19,139 +19,7 @@ real-world scenario where a single person wears the physical patch.
 import torch
 from typing import List, Dict, Optional
 
-
-def _cat_ok(label: str, target: str, exact: bool) -> bool:
-    """Category match: exact word for sim ('pot' != 'potato'), substring for YouTube."""
-    return label.lower() == target.lower() if exact else target.lower() in label.lower()
-
-
-# ── shared helpers ────────────────────────────────────────────────────────────
-
-def _patch_object_across_frames(
-    clean_frames: list,
-    bboxes: dict,
-    patch,
-    anchor,
-    config,
-    device: torch.device,
-    obj_id: int,
-) -> list:
-    """
-    Return a copy of clean_frames with the patch applied only to obj_id
-    in every frame where that object appears.  Frames without obj_id are
-    returned unchanged.
-    """
-    from functions.attack.patch import paste_patch, compute_patch_size
-    from functions.attack.anchor import anchor_center
-
-    patched = []
-    for frame_id, frame in enumerate(clean_frames):
-        frame_bboxes = bboxes.get(frame_id, {})
-        if obj_id in frame_bboxes:
-            bbox   = frame_bboxes[obj_id]
-            ph, pw = compute_patch_size(bbox, config.coverage_ratio)
-            cx, cy = anchor_center(anchor, bbox, ph, pw)
-            f = paste_patch(
-                frame.clone().to(device), patch.pixels_hwc, cx, cy, ph, pw,
-            ).cpu()
-        else:
-            f = frame
-        patched.append(f)
-    return patched
-
-
-# ── per-clip helper (kept for external use) ───────────────────────────────────
-
-def compute_flip_rate(
-    vine_model,
-    clean_frames: List[torch.Tensor],
-    patched_frames: List[torch.Tensor],
-    masks: Dict[int, Dict[int, torch.Tensor]],
-    bboxes: Dict[int, Dict[int, dict]],
-    gpt_spec: dict,
-    device: torch.device,
-    attack_mode: str,
-    target_category: str = '',
-    target_relation: str = '',
-    target_attribute: str = '',
-) -> dict:
-    """
-    Compute the prediction flip rate given pre-computed clean and patched frames.
-
-    NOTE: the caller is responsible for patching the correct objects only.
-    For batch evaluation use compute_flip_rate_across_clips() instead.
-
-    Returns:
-        dict with keys: flip_rate, n_total, n_flipped, per_object_flips
-    """
-    from functions.eval.scene_graph import predict_scene_graph
-
-    sg_clean   = predict_scene_graph(vine_model, clean_frames,   masks, bboxes, gpt_spec, device)
-    sg_patched = predict_scene_graph(vine_model, patched_frames, masks, bboxes, gpt_spec, device)
-
-    def _match(label: str, target: str) -> bool:
-        return target.lower() in label.lower()
-
-    flips: List[bool] = []
-
-    if attack_mode in ('category', 'attribute'):
-        if target_category:
-            target_obj_ids = {
-                obj_id for obj_id, cat in sg_clean.categories.items()
-                if _match(cat, target_category)
-            }
-        else:
-            target_obj_ids = set(sg_clean.categories.keys())
-
-        if attack_mode == 'attribute' and target_attribute:
-            target_obj_ids = {
-                obj_id for obj_id in target_obj_ids
-                if _match(sg_clean.attributes.get(obj_id, ''), target_attribute)
-            }
-
-        clean_preds   = sg_clean.categories   if attack_mode == 'category' else sg_clean.attributes
-        patched_preds = sg_patched.categories if attack_mode == 'category' else sg_patched.attributes
-
-        for obj_id in target_obj_ids:
-            c_pred = clean_preds.get(obj_id)
-            if c_pred is None:
-                continue
-            p_pred = patched_preds.get(obj_id)
-            flips.append(c_pred != p_pred if p_pred is not None else True)
-
-    elif attack_mode == 'relation':
-        if target_relation:
-            target_pairs = {
-                pair for pair, rel in sg_clean.relations.items()
-                if _match(rel, target_relation)
-            }
-        else:
-            target_pairs = set(sg_clean.relations.keys())
-
-        if target_category:
-            target_pairs = {
-                pair for pair in target_pairs
-                if _match(sg_clean.categories.get(pair[0], ''), target_category)
-            }
-
-        for pair in target_pairs:
-            c_pred = sg_clean.relations.get(pair)
-            if c_pred is None:
-                continue
-            p_pred = sg_patched.relations.get(pair)
-            flips.append(c_pred != p_pred if p_pred is not None else True)
-
-    else:
-        raise ValueError(f"Unknown attack_mode: {attack_mode}")
-
-    n_total   = len(flips)
-    n_flipped = sum(flips)
-    return {
-        'flip_rate':        n_flipped / n_total if n_total > 0 else 0.0,
-        'n_total':          n_total,
-        'n_flipped':        n_flipped,
-        'per_object_flips': flips,
-    }
+from functions.eval._common import _cat_ok, _patch_object_across_frames
 
 
 # ── main evaluation entry point ───────────────────────────────────────────────
@@ -177,7 +45,6 @@ def compute_flip_rate_across_clips(
     from functions.eval.scene_graph import predict_scene_graph
 
     all_results = []
-    _exact = bool(getattr(config, 'sim_data_dir', ''))
 
     for item in clip_items:
         if item is None:
@@ -194,7 +61,7 @@ def compute_flip_rate_across_clips(
         if config.attack_mode in ('category', 'attribute'):
             target_obj_ids = {
                 oid for oid, cat in sg_clean.categories.items()
-                if _cat_ok(cat, config.target_category, _exact)
+                if _cat_ok(cat, config.target_category)
             } if config.target_category else set(sg_clean.categories.keys())
 
             # Sim: also require GROUND-TRUTH category == target, so the target is a
@@ -202,7 +69,7 @@ def compute_flip_rate_across_clips(
             _gt = item.get('gt_categories')
             if _gt is not None and config.target_category:
                 target_obj_ids = {oid for oid in target_obj_ids
-                                  if _cat_ok(_gt.get(oid, ''), config.target_category, _exact)}
+                                  if _cat_ok(_gt.get(oid, ''), config.target_category)}
 
             if config.attack_mode == 'attribute' and getattr(config, 'target_attribute', ''):
                 target_obj_ids = {
@@ -255,12 +122,12 @@ def compute_flip_rate_across_clips(
             if config.target_category:
                 target_pairs = {
                     p for p in target_pairs
-                    if _cat_ok(sg_clean.categories.get(p[0], ''), config.target_category, _exact)
+                    if _cat_ok(sg_clean.categories.get(p[0], ''), config.target_category)
                 }
                 _gt = item.get('gt_categories')
                 if _gt is not None:
                     target_pairs = {p for p in target_pairs
-                                    if _cat_ok(_gt.get(p[0], ''), config.target_category, _exact)}
+                                    if _cat_ok(_gt.get(p[0], ''), config.target_category)}
 
             _min_conf = getattr(config, 'min_target_conf', 0.0)
             if _min_conf > 0:

@@ -2,16 +2,16 @@
 SimAttackDataset — adapter from a SceneGraphBench (AI2-THOR) dataset into the NSAP
 attack pipeline.
 
-Mirrors functions.attack.data.EscaAttackDataset's interface — `__getitem__` returns
-the same item dict, and `build_instance_list` / `build_relation_instance_list` return
-the same instance dicts — so train.py and the eval functions consume it unchanged.
+This is NSAP's dataset. `__getitem__` returns an item dict, and
+`build_instance_list` / `build_relation_instance_list` return the flat instance
+dicts that train.py and the eval functions consume.
 The only per-instance difference is `_png_path` (sim frames are PNGs), which
 data.load_frame handles.
 
 Because the sim ships pixel-perfect ground truth, target objects are selected by
-TRUE category (no over-segmentation guessing as on the YouTube path). The clean-
-prediction gate in train.py still runs on top, keeping only objects VINE currently
-reads correctly — so train/eval stay aligned with the YouTube pipeline's behavior.
+TRUE category (exact GT match, no over-segmentation guessing). The clean-prediction
+gate in train.py still runs on top, keeping only objects VINE currently reads
+correctly — so training focuses on objects the model actually grounds.
 """
 
 import os
@@ -67,7 +67,7 @@ def explode_to_frames(item):
 
 
 class SimAttackDataset:
-    """Loads a SceneGraphBench dataset; same interface as EscaAttackDataset."""
+    """Loads a SceneGraphBench dataset — NSAP's training/eval data source."""
 
     TRAIN_RATIO = 0.8
 
@@ -130,7 +130,7 @@ class SimAttackDataset:
                 'unary_kws': ATTRIBUTE_WORDS, 'binary_kws': RELATION_WORDS,
                 'binary_predicates': bin_preds}
 
-    # ── eval item (mirrors EscaAttackDataset.__getitem__) ────────────────────
+    # ── eval item (frames + masks + per-frame bboxes for one scenario) ───────
     def __getitem__(self, idx):
         from PIL import Image
         sdir = self.scenarios[idx]
@@ -179,8 +179,7 @@ class SimAttackDataset:
                         continue
                     instances.append({
                         'data_id': sg['scenario_id'], 'frame_id': fi, 'obj_id': o['id'],
-                        '_png_path': png, '_video_path': None, '_frame_idx': fi,
-                        '_target_fps': 1, '_max_vid_len': 999,
+                        '_png_path': png,
                         'mask': m, 'bbox': _bbox_dict(o['bbox']), 'gpt_spec': gpt_spec,
                     })
         return instances
@@ -214,8 +213,7 @@ class SimAttackDataset:
                     instances.append({
                         'data_id': sg['scenario_id'], 'frame_id': fi,
                         'subj_obj_id': so['id'], 'obj_obj_id': oo['id'],
-                        '_png_path': png, '_video_path': None, '_frame_idx': fi,
-                        '_target_fps': 1, '_max_vid_len': 999,
+                        '_png_path': png,
                         'subj_mask': sm, 'obj_mask': om,
                         'subj_bbox': _bbox_dict(so['bbox']), 'obj_bbox': _bbox_dict(oo['bbox']),
                         'gpt_spec': gpt_spec,

@@ -2,19 +2,22 @@
 NSAP — Neuro-Symbolic Adversarial Patch
 Entry point for training and evaluating adversarial patches against VINE.
 
+Data source: the self-contained SceneGraphBench (AI2-THOR) sim dataset, passed
+via --sim-data <dataset dir> (required). See SceneGraphBench/ to generate one.
+
 Usage examples
 --------------
-# Category attack on 'person', quick test (50 steps):
-python run_attack.py --mode category --target person --steps 50
+# Category attack on 'Fridge', quick test (50 steps):
+python run_attack.py --sim-data <dataset> --mode category --target Fridge --steps 50
 
-# Attribute attack on 'girl' (unary keywords), full run:
-python run_attack.py --mode attribute --target girl
+# Attribute attack on 'Microwave' (open/closed etc.), full run:
+python run_attack.py --sim-data <dataset> --mode attribute --target Microwave --attribute open
 
 # Relation attack ('next to'):
-python run_attack.py --mode relation --relation "next to" --target girl
+python run_attack.py --sim-data <dataset> --mode relation --relation "next to" --target Mug
 
 # Evaluate a saved patch:
-python run_attack.py --eval --patch output/patches/category_person/category_person_final.pt
+python run_attack.py --sim-data <dataset> --eval --patch output/patches/category_Fridge/category_Fridge_final.pt
 """
 
 import os
@@ -31,7 +34,7 @@ import torch
 
 
 def _attack_subdir(base_dir: str, mode: str, target: str, relation: str = "", attribute: str = "") -> str:
-    """Return the per-attack output directory, e.g. output/patches/category_person/"""
+    """Return the per-attack output directory, e.g. output/patches/category_Fridge/"""
     if mode == "relation" and relation:
         slug = f"relation_{relation.replace(' ', '_')}_{target.replace(' ', '_')}"
     elif mode == "attribute" and attribute:
@@ -39,50 +42,6 @@ def _attack_subdir(base_dir: str, mode: str, target: str, relation: str = "", at
     else:
         slug = f"{mode}_{target.replace(' ', '_')}"
     return os.path.join(base_dir, slug)
-
-
-def _build_download_targets(mode: str, target: str, attribute: str, relation: str) -> list:
-    """Convert attack args to the target-dict format used by download_videos."""
-    t = {}
-    if target:    t['category']  = target
-    if mode == 'attribute' and attribute: t['attribute'] = attribute
-    if mode == 'relation'  and relation:  t['relation']  = relation
-    return [t] if t else []
-
-
-def _ensure_videos(mode: str, target: str, attribute: str, relation: str,
-                   split: str = None) -> None:
-    from functions.download_videos import ensure_videos_for_targets
-    from functions.attack.data import get_split_video_stems
-
-    targets = _build_download_targets(mode, target, attribute, relation)
-    if not targets:
-        return
-
-    split_stems = None
-    if split is not None:
-        stems = get_split_video_stems(
-            dataset_dir      = os.path.join(os.path.dirname(__file__), "dataset"),
-            dataset_filename = "gpt_specs2_id_LLaVA_all.jsonl",
-            target_category  = target   or None,
-            target_attribute = attribute if mode == 'attribute' else None,
-            target_relation  = relation  if mode == 'relation'  else None,
-            split            = split,
-        )
-        split_stems = set(stems)
-        print(f"\n=== Ensuring videos for attack (split='{split}', {len(split_stems)} eligible clips) ===")
-    else:
-        print(f"\n=== Ensuring videos for attack ===")
-
-    n = ensure_videos_for_targets(targets, split_stems=split_stems)
-    if n == 0:
-        print("WARNING: no matching clips found on disk — attack may have no data.")
-
-
-def _cleanup_videos() -> None:
-    from functions.download_videos import cleanup_all_videos
-    print(f"\n=== Cleaning up downloaded videos ===")
-    cleanup_all_videos()
 
 
 def load_vine(device: str) -> "VineModel":
@@ -108,7 +67,8 @@ def run_train(args):
     from functions.attack.train import train_patch, AttackConfig
 
     if not args.sim_data:
-        _ensure_videos(args.mode, args.target, args.attribute, args.relation, split='train')
+        raise SystemExit("--sim-data <dataset dir> is required "
+                         "(the YouTube/ESCA video data source has been removed).")
 
     attack_dir = _attack_subdir(args.output_dir, args.mode, args.target, args.relation, args.attribute)
 
@@ -143,6 +103,7 @@ def run_train(args):
         lambda_dino      = args.lambda_dino,
         object_init      = args.object_init,
         lambda_content   = args.lambda_content,
+        seed             = args.seed,
     )
 
     device     = args.device
@@ -158,47 +119,18 @@ def run_train(args):
 
     patch = train_patch(
         vine_model       = vine_model,
-        dataset_dir      = os.path.join(os.path.dirname(__file__), "dataset"),
-        dataset_filename = "gpt_specs2_id_LLaVA_all.jsonl",
         config           = config,
         sam_predictor    = sam_predictor,
     )
     print("\nTraining complete.")
 
-    if not args.keep_videos:
-        _cleanup_videos()
-
     return patch
-
-
-def run_validate_bboxes(args):
-    """Validate bbox derivation + frame/mask alignment, writing overlay images."""
-    from functions.attack.data import EscaAttackDataset
-    from functions.eval.validate_bboxes import validate_bboxes
-
-    _ensure_videos(args.mode, args.target, args.attribute, args.relation, split='test')
-
-    dataset = EscaAttackDataset(
-        dataset_dir      = os.path.join(os.path.dirname(__file__), "dataset"),
-        dataset_filename = "gpt_specs2_id_LLaVA_all.jsonl",
-        target_category  = args.target or None,
-        target_attribute = args.attribute if args.mode == 'attribute' else None,
-        split            = 'test',
-    )
-
-    attack_dir = _attack_subdir(args.output_dir, args.mode, args.target, args.relation, args.attribute)
-    os.makedirs(attack_dir, exist_ok=True)
-    validate_bboxes(dataset, n_clips=args.n_clips, out_dir=attack_dir)
-
-    if not args.keep_videos:
-        _cleanup_videos()
 
 
 def run_eval(args):
     from functions.attack.train import AttackConfig
     from functions.attack.patch import AdversarialPatch
     from functions.attack.anchor import Anchor
-    from functions.attack.data import EscaAttackDataset
     from functions.eval.flip_rate import compute_flip_rate_across_clips
     from functions.eval.edit_distance import evaluate_isolation
     from functions.eval.visualize import save_sample_images
@@ -222,62 +154,46 @@ def run_eval(args):
         config.sim_data_dir = args.sim_data
 
     if not getattr(config, 'sim_data_dir', ''):
-        _ensure_videos(
-            config.attack_mode,
-            config.target_category,
-            getattr(config, 'target_attribute', ''),
-            getattr(config, 'target_relation', ''),
-            split='test',
-        )
+        raise SystemExit("--sim-data <dataset dir> is required "
+                         "(the YouTube/ESCA video data source has been removed).")
 
     ph, pw = ckpt['w'].shape[1], ckpt['w'].shape[2]
     patch  = AdversarialPatch(ph, pw, torch.device(device))
     patch.w.data.copy_(ckpt['w'])
     patch.eval()
 
-    if getattr(config, 'sim_data_dir', ''):
-        from functions.attack.sim_data import SimAttackDataset
-        _only = [args.only_scenario] if getattr(args, 'only_scenario', '') else None
-        dataset = SimAttackDataset(
-            config.sim_data_dir,
-            target_category  = config.target_category if config.attack_mode != 'relation' else None,
-            target_attribute = config.target_attribute if config.attack_mode == 'attribute' else None,
-            target_relation  = config.target_relation if config.attack_mode == 'relation' else None,
-            split            = None if _only else 'test',
-            max_clips        = getattr(config, 'max_clips', 0),
-            only_scenarios   = _only,
-        )
-    else:
-        dataset = EscaAttackDataset(
-            dataset_dir      = os.path.join(os.path.dirname(__file__), "dataset"),
-            dataset_filename = "gpt_specs2_id_LLaVA_all.jsonl",
-            target_category  = config.target_category,
-            target_attribute = config.target_attribute if config.attack_mode == 'attribute' else None,
-            split            = 'test',
-            max_clips        = getattr(config, 'max_clips', 0),
-        )
+    from functions.attack.sim_data import SimAttackDataset
+    _only = [args.only_scenario] if getattr(args, 'only_scenario', '') else None
+    dataset = SimAttackDataset(
+        config.sim_data_dir,
+        target_category  = config.target_category if config.attack_mode != 'relation' else None,
+        target_attribute = config.target_attribute if config.attack_mode == 'attribute' else None,
+        target_relation  = config.target_relation if config.attack_mode == 'relation' else None,
+        split            = None if _only else 'test',
+        max_clips        = getattr(config, 'max_clips', 0),
+        only_scenarios   = _only,
+    )
 
     test_items = [dataset[i] for i in range(len(dataset))]
 
-    # Sim: score EACH frame as its own sample (more statistical power) rather than
+    # Score EACH frame as its own sample (more statistical power) rather than
     # one selected frame per scenario.
-    if getattr(config, 'sim_data_dir', ''):
-        from functions.attack.sim_data import explode_to_frames
-        test_items = [fr for it in test_items for fr in explode_to_frames(it)]
-        # Relation eval re-scores EVERY object pair per frame (heavy); cap the
-        # frame-samples so it finishes. Category/attribute heads are cheap → keep all.
-        if config.attack_mode == 'relation' and len(test_items) > 150:
-            step = max(1, len(test_items) // 150)
-            test_items = test_items[::step]
-        print(f"  [sim] per-frame eval: {len(test_items)} frame-samples")
+    from functions.attack.sim_data import explode_to_frames
+    test_items = [fr for it in test_items for fr in explode_to_frames(it)]
+    # Relation eval re-scores EVERY object pair per frame (heavy); cap the
+    # frame-samples so it finishes. Category/attribute heads are cheap → keep all.
+    if config.attack_mode == 'relation' and len(test_items) > 150:
+        step = max(1, len(test_items) // 150)
+        test_items = test_items[::step]
+    print(f"  [sim] per-frame eval: {len(test_items)} frame-samples")
 
+    # Post-explosion each sample is a single frame, so these are frame-sample
+    # counts (kept for the results JSON, which stores both fields).
     n_loaded     = sum(1 for it in test_items if it is not None)
     total_frames = sum(len(it['frames']) for it in test_items if it is not None)
 
     print(f"\n=== Test set ===")
-    print(f"Clips requested / loaded     : {len(test_items)} / {n_loaded}  "
-          f"(rest failed to download or load)")
-    print(f"Total frames                 : {total_frames}")
+    print(f"Frame-samples                : {len(test_items)}")
     _mtc = getattr(config, 'min_target_conf', 0.0)
     if _mtc > 0:
         print(f"Target confidence gate       : category prob ≥ {_mtc:.2f}")
@@ -373,9 +289,6 @@ def run_eval(args):
         torch.device(device), patch_dir, n_samples=10,
     )
 
-    if not args.keep_videos:
-        _cleanup_videos()
-
 
 def main():
     parser = argparse.ArgumentParser(description="NSAP adversarial patch attack on VINE")
@@ -384,12 +297,12 @@ def main():
     parser.add_argument("--mode",   default="category",
                         choices=["category", "attribute", "relation"],
                         help="Attack mode")
-    parser.add_argument("--target", default="person",
-                        help="Target category string (e.g. 'person', 'girl', 'cup')")
+    parser.add_argument("--target", default="Fridge",
+                        help="Target category string (AI2-THOR sim, e.g. 'Fridge', 'Microwave', 'Mug')")
     parser.add_argument("--relation",  default="next to",
-                        help="Target relation string for --mode relation")
+                        help="Target relation string for --mode relation (e.g. 'next to', 'on')")
     parser.add_argument("--attribute", default="",
-                        help="Target attribute string for --mode attribute (e.g. 'standing')")
+                        help="Target attribute string for --mode attribute (e.g. 'open', 'closed', 'on')")
 
     # Training
     parser.add_argument("--steps",    type=int,   default=2000,  help="Training steps")
@@ -424,8 +337,8 @@ def main():
                              "object as a target (0 = off). Drops weakly-classified targets "
                              "(e.g. a table VINE calls 'person' at 0.3). Try 0.5.")
     parser.add_argument("--sim-data", default="", dest="sim_data",
-                        help="Train/eval on a SceneGraphBench (AI2-THOR) dataset at this path "
-                             "instead of the YouTube/ESCA dataset. No video download needed.")
+                        help="REQUIRED: path to the SceneGraphBench (AI2-THOR) dataset to "
+                             "train/eval on. This is NSAP's only data source.")
     parser.add_argument("--all-data", action="store_true", dest="all_data",
                         help="Train on ALL sim scenarios (no train/test split).")
     parser.add_argument("--init-patch", default="", dest="init_patch",
@@ -438,27 +351,15 @@ def main():
     parser.add_argument("--eval",  action="store_true", help="Run evaluation instead of training")
     parser.add_argument("--patch", default=None, help="Path to saved patch .pt file for --eval")
 
-    # Validation
-    parser.add_argument("--validate-bboxes", action="store_true", dest="validate_bboxes",
-                        help="Validate bbox derivation + frame/mask alignment and write overlay images")
-    parser.add_argument("--n-clips", type=int, default=10, dest="n_clips",
-                        help="Number of clips to check for --validate-bboxes")
-
-    # Videos
-    parser.add_argument(
-        "--keep-videos", action="store_true", dest="keep_videos",
-        help="Keep downloaded videos after training/eval (default: delete them)",
-    )
-
     # Misc
+    parser.add_argument("--seed", type=int, default=0,
+                        help="RNG seed for reproducible runs (diversity sampling + EoT jitter).")
     parser.add_argument("--device",     default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--output-dir", default="output/patches", dest="output_dir")
 
     args = parser.parse_args()
 
-    if args.validate_bboxes:
-        run_validate_bboxes(args)
-    elif args.eval:
+    if args.eval:
         if not args.patch:
             parser.error("--eval requires --patch <path>")
         run_eval(args)

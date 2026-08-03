@@ -12,10 +12,7 @@ import numpy as np
 import torch
 from typing import List, Optional
 
-
-def _cat_ok(label: str, target: str, exact: bool) -> bool:
-    """Category match: exact word for sim ('pot' != 'potato'), substring for YouTube."""
-    return label.lower() == target.lower() if exact else target.lower() in label.lower()
+from functions.eval._common import _cat_ok, _patch_object_on_frame
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────
@@ -98,7 +95,7 @@ def _draw_sample(
     txt = f"{clean_str} → {patched_str}"
     tx  = max(0, x1)
     ty  = max(BAR, y1 - 18)
-    draw.rectangle([tx, ty, tx + len(txt) * 7 + 4, ty + 16], fill=(0, 0, 0, 180))
+    draw.rectangle([tx, ty, tx + len(txt) * 7 + 4, ty + 16], fill=(0, 0, 0))
     draw.text((tx + 2, ty + 1), txt, font=f_small, fill=(255, 255, 255))
 
     return canvas
@@ -123,7 +120,7 @@ def save_sample_images(
               <output_dir>/samples/failed_XX_<clip>_fYY.png
 
     Args:
-        clip_items:  list of EscaAttackDataset items (may contain None)
+        clip_items:  list of dataset items (may contain None)
         patch:       trained AdversarialPatch
         anchor:      Anchor(cx, cy, label)
         config:      AttackConfig
@@ -131,9 +128,7 @@ def save_sample_images(
         output_dir:  directory where samples/ will be created
         n_samples:   max images per outcome category (default 10)
     """
-    from functions.attack.patch import paste_patch, compute_patch_size
-    from functions.attack.anchor import anchor_center
-    from functions.eval.scene_graph import predict_scene_graph
+    from functions.eval.scene_graph import predict_scene_graph, select_eval_frame
 
     samples_dir = os.path.join(output_dir, "samples")
     os.makedirs(samples_dir, exist_ok=True)
@@ -142,7 +137,6 @@ def save_sample_images(
     target_category = config.target_category
     target_relation = getattr(config, 'target_relation', '')
     target_attribute = getattr(config, 'target_attribute', '')
-    _exact          = bool(getattr(config, 'sim_data_dir', ''))
 
     worked_list: list = []
     failed_list:  list = []
@@ -169,14 +163,14 @@ def save_sample_images(
             # Filter: category must match target_category
             target_obj_ids = {
                 oid for oid, cat in sg_clean.categories.items()
-                if _cat_ok(cat, target_category, _exact)
+                if _cat_ok(cat, target_category)
             }
             # Sim: also require GROUND-TRUTH category == target, so the boxed object
             # is the REAL target, not one VINE misreads as it.
             _gt = item.get('gt_categories')
             if _gt is not None and target_category:
                 target_obj_ids = {oid for oid in target_obj_ids
-                                  if _cat_ok(_gt.get(oid, ''), target_category, _exact)}
+                                  if _cat_ok(_gt.get(oid, ''), target_category)}
             # For attribute mode also require the clean attribute to match target_attribute
             if mode == 'attribute' and target_attribute:
                 target_obj_ids = {
@@ -207,23 +201,17 @@ def save_sample_images(
                 if clean_p is None:
                     continue
 
-                # Find a frame that contains this object
-                frame_id = next(
-                    (fid for fid in sorted(bboxes.keys()) if obj_id in bboxes[fid]),
-                    None,
-                )
-                if frame_id is None or frame_id >= len(clean_frames):
+                # Show the SAME frame the metrics score (largest total mask area),
+                # restricted to frames that actually contain this object.
+                frame_id = select_eval_frame(masks, len(clean_frames), require_obj=obj_id)
+                if frame_id is None or obj_id not in bboxes.get(frame_id, {}):
                     continue
 
-                bbox   = bboxes[frame_id][obj_id]
-                ph, pw = compute_patch_size(bbox, config.coverage_ratio)
-                cx, cy = anchor_center(anchor, bbox, ph, pw)
-
-                # Patch ONLY this target object for the visualisation frame
-                patched_frame = paste_patch(
-                    clean_frames[frame_id].clone().to(device),
-                    patch.pixels_hwc, cx, cy, ph, pw,
-                ).cpu()
+                bbox = bboxes[frame_id][obj_id]
+                # Patch ONLY this target object on the visualisation frame
+                patched_frame = _patch_object_on_frame(
+                    clean_frames[frame_id], bbox, patch, anchor, config, device,
+                )
 
                 # Get attacked prediction for this single patched frame
                 sg_patched_single = predict_scene_graph(
@@ -259,12 +247,20 @@ def save_sample_images(
             if target_category:
                 target_pairs = {
                     p for p in target_pairs
-                    if _cat_ok(sg_clean.categories.get(p[0], ''), target_category, _exact)
+                    if _cat_ok(sg_clean.categories.get(p[0], ''), target_category)
                 }
                 _gt = item.get('gt_categories')
                 if _gt is not None:
                     target_pairs = {p for p in target_pairs
-                                    if _cat_ok(_gt.get(p[0], ''), target_category, _exact)}
+                                    if _cat_ok(_gt.get(p[0], ''), target_category)}
+
+            # Confidence gate on the subject category (matches flip_rate/edit_distance).
+            _min_conf = getattr(config, 'min_target_conf', 0.0)
+            if _min_conf > 0:
+                target_pairs = {
+                    p for p in target_pairs
+                    if sg_clean.category_conf.get(p[0], 0.0) >= _min_conf
+                }
 
             for pair in target_pairs:
                 subj_id = pair[0]
@@ -272,22 +268,17 @@ def save_sample_images(
                 if clean_p is None:
                     continue
 
-                frame_id = next(
-                    (fid for fid in sorted(bboxes.keys()) if subj_id in bboxes[fid]),
-                    None,
-                )
-                if frame_id is None or frame_id >= len(clean_frames):
+                # Show the SAME frame the metrics score, restricted to frames with
+                # the subject present.
+                frame_id = select_eval_frame(masks, len(clean_frames), require_obj=subj_id)
+                if frame_id is None or subj_id not in bboxes.get(frame_id, {}):
                     continue
 
                 subj_bbox = bboxes[frame_id][subj_id]
-                ph, pw    = compute_patch_size(subj_bbox, config.coverage_ratio)
-                cx, cy    = anchor_center(anchor, subj_bbox, ph, pw)
-
-                # Patch ONLY the subject object for this visualisation frame
-                patched_frame = paste_patch(
-                    clean_frames[frame_id].clone().to(device),
-                    patch.pixels_hwc, cx, cy, ph, pw,
-                ).cpu()
+                # Patch ONLY the subject object on this visualisation frame
+                patched_frame = _patch_object_on_frame(
+                    clean_frames[frame_id], subj_bbox, patch, anchor, config, device,
+                )
 
                 sg_patched_single = predict_scene_graph(
                     vine_model, [patched_frame], {0: masks.get(frame_id, {})},

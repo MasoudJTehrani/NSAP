@@ -22,6 +22,7 @@ if not os.environ.get("OPENAI_API_KEY"):
     t = open(f"{ESCA}/.openai_key").read()
     os.environ["OPENAI_API_KEY"] = re.search(r"sk-[A-Za-z0-9_-]+", t).group(0)
 os.environ.setdefault("NSAP_GD_CKPT", f"{ESCA}/checkpoints/groundingdino_swint_ogc.pth")
+os.environ.setdefault("NSAP_VINE_WEIGHTS", f"{NSAP}/model/vine/model.safetensors")  # esca.py's default is machine-specific -> pin to this repo (trained VINE, not base CLIP)
 os.chdir(NSAP)
 
 import numpy as np, torch

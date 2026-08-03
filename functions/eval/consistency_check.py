@@ -59,38 +59,54 @@ def train_category_probs(vine_model, frame_hwc, mask, bbox, keywords, device,
 
 # ── comparison ──────────────────────────────────────────────────────────────────
 
+# Max per-keyword probability gap the shipped forward may differ from eval before
+# it counts as a train/eval parity regression.
+TOLERANCE = 0.05
+
+
 def _report(name, eval_p, train_p, keywords):
     max_abs = (eval_p - train_p).abs().max().item()
     l1      = (eval_p - train_p).abs().sum().item()
     same_top1 = (eval_p.argmax().item() == train_p.argmax().item())
-    print(f"  [{name:28s}] max|Δp|={max_abs:6.3f}  L1={l1:6.3f}  "
+    print(f"  [{name:30s}] max|Δp|={max_abs:6.3f}  L1={l1:6.3f}  "
           f"top1 {'MATCH' if same_top1 else 'DIFFER'} "
-          f"(eval={keywords[eval_p.argmax()]:>10s} | train={keywords[train_p.argmax()]:>10s})")
-    return max_abs
+          f"(eval={keywords[eval_p.argmax()]:>12s} | train={keywords[train_p.argmax()]:>12s})")
+    return max_abs, same_top1
 
 
 def run(vine_model, frame_hwc, mask, bbox, keywords, device, image_size,
         eval_alpha):
-    """Print eval-vs-train divergence for several train configurations."""
+    """Print eval-vs-train divergence across train configs; return True iff the
+    SHIPPED forward matches eval within tolerance (top-1 + max|Δp|)."""
     eval_p = eval_category_probs(vine_model, frame_hwc, mask, bbox, keywords, device)
     print(f"  eval top-1 = {keywords[eval_p.argmax()]}   probs={[round(x,3) for x in eval_p.tolist()]}")
 
+    # The FIRST entry is what train.py actually uses: the full frame (no bbox crop)
+    # with the eval extract alpha. The rest are A/B references showing how crop /
+    # alpha choices move parity.
+    SHIPPED = "SHIPPED train (no-crop, a=eval)"
     configs = [
-        ("CURRENT train (crop, a=0.8)", dict(crop_to_bbox=True,  alpha=0.8)),
-        ("no-crop, a=0.8",              dict(crop_to_bbox=False, alpha=0.8)),
-        ("no-crop, a=eval",             dict(crop_to_bbox=False, alpha=eval_alpha)),
-        ("crop, a=eval",                dict(crop_to_bbox=True,  alpha=eval_alpha)),
+        (SHIPPED,          dict(crop_to_bbox=False, alpha=eval_alpha)),
+        ("no-crop, a=0.8", dict(crop_to_bbox=False, alpha=0.8)),
+        ("crop, a=eval",   dict(crop_to_bbox=True,  alpha=eval_alpha)),
+        ("crop, a=0.8",    dict(crop_to_bbox=True,  alpha=0.8)),
     ]
     results = {}
     for name, kw in configs:
         train_p = train_category_probs(
             vine_model, frame_hwc, mask, bbox, keywords, device, image_size, **kw)
         results[name] = _report(name, eval_p, train_p, keywords)
-    return results
+
+    max_abs, same_top1 = results[SHIPPED]
+    ok = same_top1 and max_abs <= TOLERANCE
+    print(f"\n  VERDICT: shipped train forward {'PASS' if ok else 'FAIL'} "
+          f"(top1 {'match' if same_top1 else 'DIFFER'}, max|Δp|={max_abs:.3f} vs tol {TOLERANCE}) "
+          f"— train {'≈' if ok else '≠'} eval")
+    return ok
 
 
 def main():
-    import os, sys, glob, pickle, numpy as np
+    import os, sys
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "src", "LASER"))
     from run_attack import load_vine
@@ -102,14 +118,14 @@ def main():
     eval_alpha = vine_model.config.alpha
     print(f"\nCLIP crop size = {image_size}, eval extract alpha = {eval_alpha}\n")
 
-    # Use a real mask (real object shape) with a deterministic synthetic frame so
-    # channel order / scale differences actually move the CLIP output.
-    mask_path = sorted(glob.glob("dataset/mini_LLaVA_10000_masks/**/*_mask.pkl", recursive=True))[0]
-    raw = pickle.load(open(mask_path, "rb"))
-    fid = sorted(raw.keys())[0]
-    oid = list(raw[fid].keys())[0]
-    m = torch.from_numpy(np.array(raw[fid][oid], dtype=bool)).squeeze(0)   # [H,W]
-    H, W = m.shape
+    # Self-contained probe: a synthetic elliptical object mask on a deterministic
+    # random frame. The random frame makes channel-order / scale differences move
+    # the CLIP output; the parity check only cares that eval and train AGREE on the
+    # same input, so no dataset is coupled in.
+    H, W = 300, 400
+    yy, xx = torch.meshgrid(torch.arange(H), torch.arange(W), indexing='ij')
+    cy0, cx0, ry, rx = H * 0.5, W * 0.5, H * 0.28, W * 0.20
+    m = (((yy - cy0) / ry) ** 2 + ((xx - cx0) / rx) ** 2) <= 1.0          # [H,W] bool
 
     g = torch.Generator().manual_seed(0)
     frame = (torch.rand(H, W, 3, generator=g) * 255.0)
@@ -117,9 +133,12 @@ def main():
     bbox = {'x1': int(xs.min()), 'y1': int(ys.min()),
             'x2': int(xs.max()) + 1, 'y2': int(ys.max()) + 1}
 
-    keywords = ["person", "dog", "car", "tree", "building", "bicycle"]
-    print(f"clip={os.path.basename(mask_path)} obj={oid} bbox={bbox} frame={H}x{W}")
-    run(vine_model, frame, m, bbox, keywords, device, image_size, eval_alpha)
+    # Any fixed vocab works — the frame is noise and we test eval-vs-train AGREEMENT,
+    # not correctness. Use a few AI2-THOR/sim categories for relevance.
+    keywords = ["Microwave", "Fridge", "Toaster", "Mug", "Apple", "CoffeeMachine"]
+    print(f"synthetic ellipse  obj bbox={bbox}  frame={H}x{W}")
+    ok = run(vine_model, frame, m, bbox, keywords, device, image_size, eval_alpha)
+    sys.exit(0 if ok else 1)
 
 
 if __name__ == "__main__":

@@ -2,7 +2,7 @@
 Precompute and cache reference Gram matrices for the Gram-based chameleon loss.
 
 The reference is the average of Gram matrices computed over N crops of the target
-category from the ESCA training set. It is fixed for the entire training run.
+category from the training set. It is fixed for the entire training run.
 """
 
 import os
@@ -65,8 +65,9 @@ def compute_reference_grams(
     Compute the average Gram matrices over N object crops.
 
     Args:
-        instance_list: flat list of instance dicts (from EscaAttackDataset.build_instance_list)
-                       each dict must have 'frame', 'mask', 'bbox' keys
+        instance_list: flat list of instance dicts (from the dataset's build_instance_list)
+                       each dict must have '_png_path' (loaded via load_frame),
+                       'mask' and 'bbox' keys
         n_instances:   maximum number of crops to average (N=500 default)
         device:        torch device
         cache_path:    if given, save/load the result from this .pt file
@@ -79,6 +80,7 @@ def compute_reference_grams(
         return torch.load(cache_path, map_location='cpu')
 
     from functions.attack.preprocess import extract_single_object_torch, crop_image_contain_bboxes_torch
+    from functions.attack.data import load_frame as _load_frame
 
     vgg = tv_models.vgg16(weights=tv_models.VGG16_Weights.IMAGENET1K_V1)
     vgg.eval().to(device)
@@ -88,12 +90,12 @@ def compute_reference_grams(
     samples = instance_list[:n_instances]
     print(f"Computing reference Gram over {len(samples)} instances...")
 
-    # Accumulate Gram matrices
+    # Accumulate Gram matrices over the crops that survive preprocessing.
     gram_accum: Optional[List[torch.Tensor]] = None
+    n_used = 0
 
     with torch.no_grad():
         for i, inst in enumerate(samples):
-            from functions.attack.data import load_frame as _load_frame
             frame = _load_frame(inst).to(device)
             mask  = inst['mask'].to(device)
             bbox  = inst['bbox']
@@ -112,6 +114,7 @@ def compute_reference_grams(
             else:
                 for j in range(len(gram_accum)):
                     gram_accum[j] += grams[j]
+            n_used += 1
 
             if (i + 1) % 50 == 0:
                 print(f"  {i + 1}/{len(samples)}")
@@ -119,8 +122,9 @@ def compute_reference_grams(
     if gram_accum is None:
         raise RuntimeError("No valid crops found to compute reference Gram matrices.")
 
-    n_valid = min(n_instances, len(samples))
-    reference = [g / n_valid for g in gram_accum]
+    # Average over the crops actually accumulated — skipped/degenerate crops must
+    # not dilute the mean (previously divided by the full sample count).
+    reference = [g / n_used for g in gram_accum]
 
     if cache_path:
         os.makedirs(os.path.dirname(cache_path), exist_ok=True)

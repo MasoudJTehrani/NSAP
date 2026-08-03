@@ -250,7 +250,8 @@ def total_loss(
     paste offset:
 
         L_total = L_attack
-                + λ_c · ( L_gram + λ_tv · L_tv + λ_dino · L_dino )    [= L_chameleon]
+                + λ_content · L_content                              [appearance anchor — the SHIPPED camouflage]
+                + λ_c · ( L_gram + λ_tv · L_tv + λ_dino · L_dino )   [= L_chameleon, LEGACY]
                 + λ_p · L_preserve
 
     Term by term (all evaluated on the patched target object):
@@ -264,18 +265,28 @@ def total_loss(
                    attribute→clip_unary_model/`unary_kws`,
                    relation→clip_binary_model/`binary_kws`.
 
+      L_content  — THE effective camouflage (l_chameleon_content): pixel-L2 between the
+                   patch and a real crop of the target object. Combined with object-
+                   initialisation this is what makes the patch actually LOOK like the
+                   object (hidden AND still flips). λ_content is the stealth↔flip knob
+                   (high = hidden/weaker flip, low = strong flip/louder). It is added
+                   directly (NOT scaled by λ_c). This REPLACED the gram/tv/dino stack
+                   below, which matched only texture statistics and produced a loud
+                   rainbow. Off (λ_content=0) unless --object-init / --lambda-content.
+
       L_preserve — Σ KL(P_clean ‖ P_patched) over the NON-attacked heads of the
                    same object. Keeps the other scene-graph predictions unchanged,
                    giving a surgical (isolated) attack rather than global damage.
 
-      L_chameleon — naturalness regulariser on the patch so it reads as a benign
-                   object rather than noise:
-                     L_gram  : VGG16 Gram-matrix style distance to real object crops,
+      L_chameleon (LEGACY — kept for ablation, NOT in the shipped recipe): the old
+                   naturalness regulariser that never actually hid the patch —
+                     L_gram  : VGG16 Gram-matrix (texture-statistic) distance to crops,
                      L_tv    : total variation (spatial smoothness),
                      L_dino  : DINOv2 CLS-token distance between the patch region and
                                the full frame (semantic blending into the scene).
 
-    Defaults: λ_c=1.0, λ_tv=1e-4, λ_dino=0.5, λ_p=0.5, κ=0 (flip the top-1 label).
+    Defaults: λ_content=0 (set >0 with object-init), λ_c=1.0, λ_tv=1e-4, λ_dino=0.5,
+    λ_p=0.5, κ=0 (flip the top-1 label).
     """
     chameleon = gram_loss + lambda_tv * tv_loss + lambda_dino * dino_loss
     out = attack_loss + lambda_c * chameleon + lambda_p * preserve_loss
