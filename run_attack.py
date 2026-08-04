@@ -241,10 +241,18 @@ def run_eval(args):
     print(f"  TOTAL changes        : {iso_results['total_changes']:4d}")
 
     print(f"Isolation score:")
-    print(f"  pooled    : {iso_results['pooled_isolation_score']:.1%}  "
-          f"({attacked_ct}/{iso_results['total_changes']} of ALL changes hit the attacked head)")
-    print(f"  per-clip  : {iso_results['mean_isolation_score']:.1%}  "
-          f"(avg over clips; clips with NO changes count as 100% — inflates this)")
+    _pool = iso_results['pooled_isolation_score']
+    if _pool is None:
+        _why = "no target objects found" if n_obj == 0 else "attack changed nothing on the target"
+        print(f"  pooled    : n/a  ({_why} — nothing to isolate)")
+    else:
+        print(f"  pooled    : {_pool:.1%}  "
+              f"({attacked_ct}/{iso_results['total_changes']} of ALL changes hit the attacked head)")
+    _perclip = iso_results['mean_isolation_score']
+    if _perclip is None:
+        print(f"  per-clip  : n/a  (no clip had any change to attribute)")
+    else:
+        print(f"  per-clip  : {_perclip:.1%}  (avg over clips that HAD changes)")
 
     # Save results as JSON in the same directory as the patch file
     results = {

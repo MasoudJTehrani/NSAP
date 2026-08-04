@@ -53,7 +53,7 @@ echo "===== Step 2a: MIM head-flip rate (embench env) ====="
 echo "===== Step 2b: MIM behavioral task-success (embench env) ====="
 # Full closed-loop planner episodes per condition -> did the robot's behavior change?
 # Writes output/rung2/{<task>_result.json, sweep_summary.json} + per-step frames.
-"$EMBENCH_PY" rung2/harness.py --tasks-file "$TASKS" \
+"$EMBENCH_PY" rung2/harness.py --tasks-file "$TASKS" --task all \
     --conditions base_benign,esca_benign,esca_patch
 
 echo

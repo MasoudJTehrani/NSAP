@@ -66,14 +66,15 @@ class EditDistanceResult:
             + self.target_disappeared
         )
 
-    def isolation_score(self, attack_mode: str) -> float:
+    def isolation_score(self, attack_mode: str):
         """
         Fraction of changes on target objects that hit the attacked head.
         1.0 = perfectly isolated; 0.0 = all changes were collateral.
-        Returns 1.0 when there are no changes (nothing to isolate).
+        Returns None when there are NO changes — isolation is undefined then
+        (an attack that changed nothing is NOT "perfectly isolated").
         """
         if self.total_changes == 0:
-            return 1.0
+            return None
         if attack_mode == 'category':
             return (self.category_changes + self.target_disappeared) / self.total_changes
         if attack_mode == 'attribute':
@@ -265,9 +266,16 @@ def evaluate_isolation(
     else:
         attacked_total = 0
     # Pooled isolation: of ALL changes on target objects, the fraction that hit
-    # the attacked head. Unlike the per-clip mean, no-change clips do NOT count
-    # as 100% — so this reflects focus only over clips where something changed.
-    pooled_isolation = (attacked_total / tot_changes) if tot_changes else 1.0
+    # the attacked head. None when there were NO changes at all (0 target objects,
+    # or the attack flipped nothing) — isolation is undefined then, NOT 100%.
+    pooled_isolation = (attacked_total / tot_changes) if tot_changes else None
+
+    # Per-clip mean isolation: average ONLY over clips that actually had changes.
+    # A no-change clip has undefined isolation; the old code counted it as 100%,
+    # which inflated the mean. None when no clip changed anything.
+    _iso = [s for s in (e.isolation_score(config.attack_mode) for e in all_edits)
+            if s is not None]
+    mean_isolation = (sum(_iso) / len(_iso)) if _iso else None
 
     return {
         'mean_n_target_objects':      sum(e.n_target_objects       for e in all_edits) / n,
@@ -275,7 +283,7 @@ def evaluate_isolation(
         'mean_attribute_change_rate': sum(e.attribute_change_rate  for e in all_edits) / n,
         'mean_relation_change_rate':  sum(e.relation_change_rate   for e in all_edits) / n,
         'mean_disappear_rate':        sum(e.disappear_rate         for e in all_edits) / n,
-        'mean_isolation_score':       sum(e.isolation_score(config.attack_mode) for e in all_edits) / n,
+        'mean_isolation_score':       mean_isolation,
         # raw counts (pooled)
         'n_clips':                  n,
         'n_clips_with_targets':     sum(1 for e in all_edits if e.n_target_objects > 0),
