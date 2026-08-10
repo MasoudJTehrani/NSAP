@@ -188,6 +188,31 @@ class Rung2Env:
                 self.navigate_to(o)
                 self.c.step(action=it["action"], objectId=o["objectId"], forceAction=True)
 
+    # ── MIM isolation test: strip confusable objects from the scene ───────────
+    def isolate_target(self, target_id, keep_support=True):
+        """Disable non-target PICKUPABLE/MOVEABLE objects — the confusable items and
+        small appliances (potato/bowl/bread/coffee-machine...) that VINE misreads as
+        the target category, producing spurious detections that survive the patch's
+        flip. Structural objects (floor/walls/counters/cabinets) are LEFT in place:
+        they ARE in objects(), and disabling them breaks THOR's floor/navmesh so the
+        next TeleportFull fails ('too large a change') and the target drops off its
+        support. Only the live MIM scene is affected; the dataset is untouched.
+        Returns the number of objects disabled."""
+        tgt  = self.obj_by_id(target_id)
+        keep = {target_id}
+        if keep_support and tgt:
+            keep.update(tgt.get("parentReceptacles") or [])
+        disabled = 0
+        for o in list(self.objects()):
+            if o["objectId"] in keep:
+                continue
+            if not (o.get("pickupable") or o.get("moveable")):
+                continue   # structural — removing it breaks navigation; keep it
+            ev = self.c.step(action="DisableObject", objectId=o["objectId"])
+            if ev.metadata.get("lastActionSuccess"):
+                disabled += 1
+        return disabled
+
     # ── success checks ───────────────────────────────────────────────────────
     def check_success(self, spec):
         t = spec["type"]
@@ -232,6 +257,62 @@ class Rung2Env:
                         "x2": int(xs.max()), "y2": int(ys.max())}
                 return np.array(ev.frame), m, bbox
         return None, None, None
+
+    # ── EB-Navigation: real step-by-step movement + GT-distance metric ────────
+    # Replicates EmbodiedBench's EB-Navigation (envs/eb_navigation/EBNavEnv.py):
+    # 8 discrete move/rotate/look skills, success = GT distance(agent,target) <= 1 m.
+    # We keep this alongside the ALFRED skills so the SAME env can do the nav MIM test.
+    NAV_SKILLS = [
+        "Move forward by 0.25", "Move backward by 0.25",
+        "Move rightward by 0.25", "Move leftward by 0.25",
+        "Rotate to the right by 90 degrees.", "Rotate to the left by 90 degrees.",
+        "Tilt the camera upward by 30 degrees.", "Tilt the camera downward by 30 degrees.",
+    ]
+
+    def nav_move(self, action):
+        """Execute one EB-Navigation movement skill (string from NAV_SKILLS or its index).
+        Mirrors EBNavEnv.discrete_action_mapper. Returns (success, feedback)."""
+        a = action.strip().lower() if isinstance(action, str) else \
+            (self.NAV_SKILLS[action].lower() if isinstance(action, int)
+             and 0 <= action < len(self.NAV_SKILLS) else "")
+        step = self.c.step
+        if "forward" in a:                         ev = step(action="MoveAhead", moveMagnitude=0.25)
+        elif "backward" in a:                      ev = step(action="MoveBack",  moveMagnitude=0.25)
+        elif "rightward" in a:                     ev = step(action="MoveRight", moveMagnitude=0.25)
+        elif "leftward" in a:                      ev = step(action="MoveLeft",  moveMagnitude=0.25)
+        elif "rotate" in a and "right" in a:       ev = step(action="RotateRight", degrees=90)
+        elif "rotate" in a and "left" in a:        ev = step(action="RotateLeft",  degrees=90)
+        elif ("up" in a) or ("upward" in a):       ev = step(action="LookUp",   degrees=30)
+        elif ("down" in a) or ("downward" in a):   ev = step(action="LookDown", degrees=30)
+        else:
+            return False, f"unknown nav action: {action}"
+        ok = ev.metadata["lastActionSuccess"]
+        return ok, ("moved" if ok else (ev.metadata.get("errorMessage", "") or "blocked")[:80])
+
+    def nav_distance(self, target_id):
+        """GT Euclidean distance (x,z) from the agent to the target object (EB-Navigation)."""
+        o = self.obj_by_id(target_id)
+        if not o:
+            return float("inf")
+        ap, tp = self._agent_pos(), o["position"]
+        return ((ap["x"] - tp["x"]) ** 2 + (ap["z"] - tp["z"]) ** 2) ** 0.5
+
+    def nav_start(self, target_id, min_dist=2.5, seed=0):
+        """Place the agent at a reachable pose >= min_dist from the target (so it must
+        actually navigate), facing a random cardinal direction. Returns the start distance."""
+        import random
+        o = self.obj_by_id(target_id)
+        if not o or not self.reach:
+            return None
+        tp = o["position"]
+        far = [p for p in self.reach
+               if ((p["x"] - tp["x"]) ** 2 + (p["z"] - tp["z"]) ** 2) ** 0.5 >= min_dist]
+        rng = random.Random(seed)
+        pos = rng.choice(far or self.reach)
+        self.c.step(action="TeleportFull", position=pos,
+                    rotation=dict(x=0, y=rng.choice([0, 90, 180, 270]), z=0),
+                    horizon=0, standing=True)
+        return self.nav_distance(target_id)
 
     def render_frame(self):
         return np.array(self.c.last_event.frame)

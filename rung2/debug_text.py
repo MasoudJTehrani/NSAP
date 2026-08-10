@@ -18,11 +18,29 @@ from functions.attack.patch import paste_patch, compute_patch_size
 from functions.attack.anchor import anchor_center
 
 
-def run_task(planner, task):
+def _draw_boxes(src_png, boxes_full, out_png):
+    """Draw SGClip's ACTUAL per-box (category, conf) on the real frame — the truthful
+    annotated view of what VINE classified. ESCA's own obs_bbox.png overlay is drawn on
+    a clean/cached frame with GD's labels, so it disagrees with the real grounding; this
+    draws last_boxes_full (pixel bbox + SGClip category + conf) on the patched frame."""
+    from PIL import ImageDraw
+    img = Image.open(src_png).convert("RGB")
+    d = ImageDraw.Draw(img)
+    for bbox, cat, conf in boxes_full:
+        x1, y1, x2, y2 = (int(v) for v in bbox)
+        d.rectangle([x1, y1, x2, y2], outline=(255, 60, 60), width=2)
+        d.text((x1 + 2, max(0, y1 - 10)), f"{cat} {conf:.2f}", fill=(255, 60, 60))
+    img.save(out_png)
+
+
+def run_task(planner, task, isolate=True):
     env = Rung2Env(task["scene"], resolution=600)
     if task.get("init"):
         env.run_init(task["init"])
     tid = (env._nearest(task["target_type"]) or {}).get("objectId")
+    if isolate and tid:   # match the harness: strip confusable objects before viewing
+        n = env.isolate_target(tid)
+        print(f"  [isolate] removed {n} movable objects (kept {task['target_type']} + structure)")
     frame, mask, bbox = env.view_target(tid)
     env.stop()
     if frame is None:
@@ -41,6 +59,10 @@ def run_task(planner, task):
     def grab(img_rel):
         planner.reset()
         _action, out_str = planner.act(img_rel, task["instruction"])
+        # Draw SGClip's REAL per-box classification on the actual frame -> <img>_planner.png
+        # (truthful; ESCA's own obs_bbox.png overlay is drawn on a clean/cached frame).
+        _draw_boxes(img_rel, getattr(planner, "last_boxes_full", []),
+                    img_rel.replace(".png", "_planner.png"))
         try:                       # out_str is the full MLLM plan JSON (esca.py act() line 2635)
             plan = json.loads(out_str)
         except Exception:
@@ -52,6 +74,7 @@ def run_task(planner, task):
                 # language_plan, executable_plan (the {action_id, action_name} steps), scene_graph
                 "plan": plan,
                 "n_boxes": getattr(planner, "last_n_boxes", 0),
+                "boxes_full": getattr(planner, "last_boxes_full", []),
                 "box_dump": getattr(planner, "last_box_dump", [])}
 
     clean = grab(f"{outdir}/clean.png")
@@ -77,6 +100,8 @@ def main():
     ap.add_argument("--tasks", default="", help="comma list of task ids (default: all in the file)")
     ap.add_argument("--patch", default=None, help="override each task's patch path (e.g. a new EOT patch)")
     ap.add_argument("--use-uni", action="store_true", help="use each task's universal EOT patch output/chexp/uni_<id>/...")
+    ap.add_argument("--no-isolate", action="store_false", dest="isolate",
+                    help="Debug the FULL scene (default: isolate the target like the harness).")
     args = ap.parse_args()
     TASKS = {t["id"]: t for t in json.load(open(args.tasks_file))["tasks"]}
     planner = make_planner(scene_graph_text=True, language_only=False)
@@ -89,7 +114,7 @@ def main():
             task = {**task, "patch": args.patch}
         print(f"\n\n################ {tid}  ({task['scene']}, {task['target_type']}, mode={task['mode']}) ################")
         print(f"instruction: {task['instruction']}")
-        r = run_task(planner, task)
+        r = run_task(planner, task, isolate=args.isolate)
         if r is None:
             print("  (target not visible from any viewpoint)")
             continue
