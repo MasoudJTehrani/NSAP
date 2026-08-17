@@ -1,0 +1,30 @@
+{
+  "_comment": "LOCAL (NSAP-only) config: pilot-style, SCENE-MATCHED to the 12 EB-Navigation scenarios we evaluate. One scenario per exact EB-Nav target instance (matched by objectId, fallback = nearest same-category object to the EB-Nav position). Framing = a moderate 'pilot band' (~0.8-1.5m, where EB-Nav success is decided), NOT the far->close approach. Objects kept in DEFAULT state (no open/close), matching EB-Nav. Generate with: python rung2/gen_ebnav_dataset.py --config rung2/kitchen_ebnav.json --out SceneGraphBench/data/kitchen_ebnav",
+  "resolution": 600,
+  "min_area": 600,
+  "seed": 0,
+  "randomize_states": false,
+  "randomize_materials": false,
+
+  "framing": {
+    "style": "pilot_band",
+    "dists": [0.9, 1.1, 1.3, 1.5],
+    "views_per_dist": 3,
+    "tol": 0.35
+  },
+
+  "targets": [
+    {"scene": 12, "category": "Pot",           "object_id": "Pot|-00.82|+00.93|+00.82",           "pos": [-0.82,  0.82]},
+    {"scene": 13, "category": "Toaster",       "object_id": "Toaster|-03.58|+00.91|+01.76",       "pos": [-3.58,  1.76]},
+    {"scene": 14, "category": "Pot",           "object_id": "Pot|+01.53|+00.91|+00.06",           "pos": [ 1.53,  0.06]},
+    {"scene": 15, "category": "Pot",           "object_id": "Pot|-03.14|+00.96|+02.37",           "pos": [-3.14,  2.37]},
+    {"scene": 18, "category": "Toaster",       "object_id": "Toaster|+01.47|+00.98|+04.71",       "pos": [ 1.47,  4.71]},
+    {"scene": 20, "category": "Toaster",       "object_id": "Toaster|+00.78|+00.90|-02.08",       "pos": [ 0.78, -2.08]},
+    {"scene": 22, "category": "Kettle",        "object_id": "Kettle|-02.62|+00.93|-00.72",        "pos": [-2.62, -0.72]},
+    {"scene": 24, "category": "Pot",           "object_id": "Pot|+00.62|+00.85|+01.40",           "pos": [ 0.62,  1.40]},
+    {"scene": 26, "category": "Pot",           "object_id": "Pot|-02.54|+00.72|+02.55",           "pos": [-2.54,  2.55]},
+    {"scene": 27, "category": "Pot",           "object_id": "Pot|+01.85|+00.93|+01.50",           "pos": [ 1.85,  1.50]},
+    {"scene": 29, "category": "Kettle",        "object_id": "Kettle|+00.01|+01.06|-01.40",        "pos": [ 0.01, -1.40]},
+    {"scene": 30, "category": "CoffeeMachine", "object_id": "CoffeeMachine|+03.21|+00.89|+00.70", "pos": [ 3.21,  0.70]}
+  ]
+}

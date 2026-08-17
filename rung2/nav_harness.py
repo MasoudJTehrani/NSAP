@@ -45,24 +45,37 @@ def make_nav_planner(scene_graph_text, language_only, model_name="gpt-4o"):
         examples=(NAV_SG_EX if scene_graph_text else NAV_EX), scene_graph_examples=NAV_TGT_EX,
         n_shot=2, obs_key="head_rgb", chat_history=False, language_only=language_only,
         scene_graph_text=scene_graph_text, gd_only=False, tp=1, top_k=1, aggr_thres=0.4,
+        # CRITICAL: boundingbox gates whether grounding survives -> whether the scene graph
+        # is actually built into the prompt (with it False the planner resets target_labels=[]
+        # and NO SG ever reaches the MLLM). Tie it to scene_graph_text so esca/lang truly use
+        # VINE's SG (and base doesn't). Also makes the planner write the per-step grounded view.
+        boundingbox=scene_graph_text,
         gd_config_path=gd_cfg, gd_checkpoint_path=os.environ["NSAP_GD_CKPT"])
 
 
-def run_episode(task, planner, inject, tag, max_steps=20, seed=0, success_dist=1.0):
+def run_episode(task, planner, inject, cond, seed=0, max_steps=20, success_dist=1.0, isolate=False):
     import shutil
-    ep_dir = f"output/rung2/nav/{task['id']}__{tag}"
+    # visualization layout: task -> condition -> seed
+    ep_dir = f"output/rung2/nav/{task['id']}/{cond}/s{seed}"
     if os.path.isdir(ep_dir):
         shutil.rmtree(ep_dir)
     os.makedirs(ep_dir, exist_ok=True)
 
     env = Rung2Env(task["scene"], resolution=600)
     env.run_init(task.get("init"))
-    target_id = (env._nearest(task["target_type"]) or {}).get("objectId")
-    if not target_id:
+    # exact EB-Nav target instance if given, else nearest of type
+    target_id = task.get("target_id") or (env._nearest(task["target_type"]) or {}).get("objectId")
+    if not target_id or not env.obj_by_id(target_id):
         env.stop()
-        return {"success": False, "error": f"no {task['target_type']} in scene"}
+        return {"success": False, "error": f"no {task.get('target_id') or task['target_type']} in scene"}
+    if isolate:                       # MIM isolation: strip distractor objects, keep target + structure
+        n_dis = env.isolate_target(target_id)
+        print(f"      [isolate] removed {n_dis} movable objects (kept {task['target_type']} + structure)", flush=True)
     patch = load_patch(os.path.join(NSAP, task["patch"])) if inject else None
-    start_dist = env.nav_start(target_id, min_dist=2.5, seed=seed)   # drop agent >=2.5m away
+    if task.get("start_pose"):        # EB-Navigation fixed start (long_horizon starts facing AWAY)
+        start_dist = env.teleport_pose(task["start_pose"], target_id)
+    else:                             # else spawn beyond success radius, facing the target
+        start_dist = env.nav_start(target_id, seed=seed, success_dist=success_dist)
     planner.reset(); planner.set_actions(NAV_SKILLS)
     instr = task["instruction"]
 
@@ -72,6 +85,9 @@ def run_episode(task, planner, inject, tag, max_steps=20, seed=0, success_dist=1
     dframe = 0                 # decision counter (for the per-step grounded view)
     frames_with_patch = int(fl)
     trace = []
+    sg_texts = []              # NSAP text-audit: VINE's grounded labels per decision step
+    tgt_kw = task["target_type"].lower()   # e.g. "coffeemachine" ; also match spaced form
+    tgt_kw2 = "".join(c for c in tgt_kw if c.isalpha())
     dist = env.nav_distance(target_id)
     dists = [dist]
     while steps < max_steps and not reached:
@@ -83,6 +99,17 @@ def run_episode(task, planner, inject, tag, max_steps=20, seed=0, success_dist=1
         except Exception as e:
             import traceback as _tb; _tb.print_exc()
             trace.append(("PLANNER_ERROR", False, repr(e)[:100])); break
+        # capture what VINE grounded (the text the MLLM was given) this step
+        _labels = list(getattr(planner, "_nsap_last_labels", []) or [])
+        _norm = "".join(c for c in " ".join(map(str, _labels)).lower() if c.isalpha() or c == " ")
+        _gd_labels = list(getattr(planner, "_nsap_gd_labels", []) or [])
+        _gd_n = getattr(planner, "_nsap_gd_nboxes", None)
+        _gd_norm = "".join(c for c in " ".join(map(str, _gd_labels)).lower() if c.isalpha())
+        sg_texts.append({"step": dframe, "labels": _labels, "dist": round(float(dist), 2),
+                         "target_grounded": (tgt_kw2 in _norm.replace(" ", "")),
+                         # suppression-locus: what GroundingDINO (detector) returned before VINE
+                         "gd_labels": _gd_labels, "gd_nboxes": _gd_n,
+                         "gd_found_target": (tgt_kw2 in _gd_norm)})
         # VINE's grounded view of the frame just planned on (nav planner writes obs_bbox.png)
         _bx = "output/rung2/obs/obs_bbox.png"
         if os.path.exists(_bx):
@@ -118,8 +145,11 @@ def run_episode(task, planner, inject, tag, max_steps=20, seed=0, success_dist=1
     result = {"success": bool(success), "reached": reached, "steps": steps,
               "start_dist": round(float(start_dist), 3) if start_dist is not None else None,
               "final_dist": round(float(dist), 3), "min_dist": round(float(min(dists)), 3),
-              "frames_with_patch": frames_with_patch, "trace": trace}
-    json.dump({"task": task["id"], "instruction": instr, "condition": tag, **result},
+              "frames_with_patch": frames_with_patch, "trace": trace,
+              "sg_texts": sg_texts,
+              "target_grounded_steps": sum(1 for s in sg_texts if s["target_grounded"]),
+              "n_decision_steps": len(sg_texts)}
+    json.dump({"task": task["id"], "instruction": instr, "condition": cond, "seed": seed, **result},
               open(f"{ep_dir}/episode.json", "w"), indent=2, default=str)
     return result
 
@@ -134,9 +164,18 @@ def main():
     ap.add_argument("--seeds", default="0,1,2,3,4,5,6,7", help="comma list of start-pose seeds; SR = successes / len(seeds)")
     ap.add_argument("--success-dist", type=float, default=1.0,
                     help="GT distance (m) counted as reaching the target (EB-Navigation uses 1.0)")
+    ap.add_argument("--patch-override", default="",
+                    help="swap a task's patch file: 'taskid=/abs/path.pt,taskid=/abs/path.pt' (abs path bypasses NSAP join)")
+    ap.add_argument("--isolate", action="store_true",
+                    help="strip distractor objects from the scene (keep target + structure) before each episode")
     args = ap.parse_args()
     data = json.load(open(args.tasks_file))
     TASKS = {t["id"]: t for t in data["tasks"]}
+    overrides = dict(kv.split("=", 1) for kv in args.patch_override.split(",") if "=" in kv)
+    for tid, ppath in overrides.items():
+        if tid in TASKS:
+            TASKS[tid]["patch"] = ppath   # abs path: os.path.join(NSAP, abs) == abs
+            print(f"  [patch-override] {tid} -> {ppath}", flush=True)
     task_ids = list(TASKS) if args.task == "all" else args.task.split(",")
     missing = [t for t in task_ids if t not in TASKS]
     if missing:
@@ -169,7 +208,7 @@ def main():
             succs, mins, finals, pfs = [], [], [], []
             for seed in seeds:
                 try:
-                    r = run_episode(task, planner, inj, f"{cond}__s{seed}", args.max_steps, seed, args.success_dist)
+                    r = run_episode(task, planner, inj, cond, seed, args.max_steps, args.success_dist, args.isolate)
                 except Exception as e:
                     import traceback as _tb; _tb.print_exc()
                     r = {"success": False, "min_dist": None, "final_dist": None, "steps": 0,

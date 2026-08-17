@@ -1,6 +1,9 @@
 # Graphify
-
 graphify-out/
+
+# EmbodiedBench output
+running
+
 # --- NSAP project ---
 # Dataset (annotations, masks, videos, frames — all large)
 dataset/

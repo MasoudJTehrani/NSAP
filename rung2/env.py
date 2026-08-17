@@ -297,21 +297,42 @@ class Rung2Env:
         ap, tp = self._agent_pos(), o["position"]
         return ((ap["x"] - tp["x"]) ** 2 + (ap["z"] - tp["z"]) ** 2) ** 0.5
 
-    def nav_start(self, target_id, min_dist=2.5, seed=0):
-        """Place the agent at a reachable pose >= min_dist from the target (so it must
-        actually navigate), facing a random cardinal direction. Returns the start distance."""
-        import random
+    def nav_start(self, target_id, seed=0, success_dist=1.5, near_margin=0.75, far_margin=2.0,
+                  face_jitter=35.0):
+        """Face the agent toward the target (yaw +/- face_jitter) at a distance STRICTLY
+        beyond the success radius -- in [success_dist+near_margin, success_dist+far_margin] --
+        so it always has to actually move (it can NEVER spawn already inside the success
+        radius and count as trivially done). The fallbacks also stay beyond the radius; only
+        if the target is completely boxed in do we take the farthest reachable poses.
+        Returns the start distance."""
+        import random, math
         o = self.obj_by_id(target_id)
         if not o or not self.reach:
             return None
         tp = o["position"]
-        far = [p for p in self.reach
-               if ((p["x"] - tp["x"]) ** 2 + (p["z"] - tp["z"]) ** 2) ** 0.5 >= min_dist]
+        def d(p):
+            return ((p["x"] - tp["x"]) ** 2 + (p["z"] - tp["z"]) ** 2) ** 0.5
+        lo, hi = success_dist + near_margin, success_dist + far_margin
+        band = ([p for p in self.reach if lo <= d(p) <= hi]
+                or [p for p in self.reach if d(p) >= lo]              # beyond radius, any distance
+                or sorted(self.reach, key=d, reverse=True)[:5])       # target boxed in -> farthest
         rng = random.Random(seed)
-        pos = rng.choice(far or self.reach)
+        pos = rng.choice(band)
+        # THOR yaw: 0 deg faces +z, 90 deg faces +x -> atan2(dx, dz) points at the target.
+        dx, dz = tp["x"] - pos["x"], tp["z"] - pos["z"]
+        yaw = (math.degrees(math.atan2(dx, dz)) + rng.uniform(-face_jitter, face_jitter)) % 360
         self.c.step(action="TeleportFull", position=pos,
-                    rotation=dict(x=0, y=rng.choice([0, 90, 180, 270]), z=0),
-                    horizon=0, standing=True)
+                    rotation=dict(x=0, y=yaw, z=0), horizon=0, standing=True)
+        return self.nav_distance(target_id)
+
+    def teleport_pose(self, pose, target_id):
+        """Teleport to an EXACT pose (EB-Navigation start: position + rotation + horizon),
+        e.g. long_horizon starts facing AWAY from the target. Returns the start distance."""
+        p = pose["position"]
+        self.c.step(action="TeleportFull",
+                    position=dict(x=p["x"], y=p["y"], z=p["z"]),
+                    rotation=dict(x=0, y=pose.get("rotation", 0), z=0),
+                    horizon=pose.get("horizon", 0), standing=True)
         return self.nav_distance(target_id)
 
     def render_frame(self):

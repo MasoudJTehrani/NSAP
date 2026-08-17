@@ -398,10 +398,17 @@ def main():
                          "background regions AS the target. Kills the immovable false-positive "
                          "'toaster'/'pot' boxes the patch can't reach. (Helps toaster; note it "
                          "can erase context-dependent targets like the pot.)")
+    ap.add_argument("--patch-override", default="",
+                    help="swap a task's patch file: 'taskid=/abs/path.pt,...' (abs path bypasses NSAP join)")
     args = ap.parse_args()
     global TASKS
     _data = json.load(open(args.tasks_file))
     TASKS = {t["id"]: t for t in _data["tasks"]}
+    _ov = dict(kv.split("=", 1) for kv in args.patch_override.split(",") if "=" in kv)
+    for _tid, _pp in _ov.items():
+        if _tid in TASKS:
+            TASKS[_tid]["patch"] = _pp   # abs path: os.path.join(NSAP, abs) == abs
+            print(f"  [patch-override] {_tid} -> {_pp}", flush=True)
     file_max_steps = _data.get("max_steps", args.max_steps)   # file-level default; a task can override
     task_ids = list(TASKS) if args.task == "all" else args.task.split(",")
     missing = [t for t in task_ids if t not in TASKS]

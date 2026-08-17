@@ -21,6 +21,7 @@ import os
 import sys
 import json
 import random
+import argparse
 import subprocess
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -123,6 +124,23 @@ def pick_scenarios(spec, n):
 
 
 def main():
+    global DATA, EXP, N, SPECS, MAN
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--data", default=DATA, help="sim dataset dir (default: kitchen_pilot)")
+    ap.add_argument("--exp", default=EXP, help="output dir for patches (default: output/chexp)")
+    ap.add_argument("--n", type=int, default=N, help="chameleons per target category (Phase 2)")
+    ap.add_argument("--categories", default="",
+                    help="comma list -> run ONLY these category targets (else the full default SPECS)")
+    args = ap.parse_args()
+    DATA = os.path.abspath(args.data)
+    EXP = os.path.abspath(args.exp)
+    N = args.n
+    os.makedirs(EXP, exist_ok=True)
+    MAN = json.load(open(os.path.join(DATA, "manifest.json")))
+    if args.categories:
+        SPECS = [("category", t.strip(), "", "") for t in args.categories.split(",")]
+    print(f"[chameleon sweep] data={DATA}\n  exp={EXP}  N={N}\n  specs={[s[1] for s in SPECS]}", flush=True)
+
     summary = []
     for spec in SPECS:
         slug = spec_slug(spec)
