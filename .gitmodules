@@ -2,3 +2,7 @@
 	path = external/ESCA
 	url = https://github.com/MasoudJTehrani/ESCA.git
 	branch = nsap
+[submodule "SceneGraphBench"]
+	path = SceneGraphBench
+	url = https://github.com/MasoudJTehrani/SGDS_AI2_THOR.git
+	branch = main
