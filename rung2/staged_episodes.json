@@ -1,0 +1,325 @@
+[
+  {
+    "ep_id": "attr_FloorPlan201",
+    "task": "attribute",
+    "scene": "FloorPlan201",
+    "scenario_id": "00000",
+    "distractor_type": "Sofa",
+    "agentPose": {
+      "position": {
+        "x": -4.300000190734863,
+        "y": 0.9026566743850708,
+        "z": 4.300000190734863
+      },
+      "rotation": 0,
+      "horizon": 0
+    },
+    "instruction": "If the television is turned on, navigate to it. Otherwise, navigate to the sofa."
+  },
+  {
+    "ep_id": "attr_FloorPlan202",
+    "task": "attribute",
+    "scene": "FloorPlan202",
+    "scenario_id": "00001",
+    "distractor_type": "Sofa",
+    "agentPose": {
+      "position": {
+        "x": -2.799999952316284,
+        "y": 0.9010459184646606,
+        "z": 1.7000000476837158
+      },
+      "rotation": 0,
+      "horizon": 0
+    },
+    "instruction": "If the television is turned on, navigate to it. Otherwise, navigate to the sofa."
+  },
+  {
+    "ep_id": "attr_FloorPlan203",
+    "task": "attribute",
+    "scene": "FloorPlan203",
+    "scenario_id": "00002",
+    "distractor_type": "Sofa",
+    "agentPose": {
+      "position": {
+        "x": -0.20000004768371582,
+        "y": 0.9070531129837036,
+        "z": 0.40000009536743164
+      },
+      "rotation": 0,
+      "horizon": 0
+    },
+    "instruction": "If the television is turned on, navigate to it. Otherwise, navigate to the sofa."
+  },
+  {
+    "ep_id": "attr_FloorPlan204",
+    "task": "attribute",
+    "scene": "FloorPlan204",
+    "scenario_id": "00003",
+    "distractor_type": "Sofa",
+    "agentPose": {
+      "position": {
+        "x": 0.40000009536743164,
+        "y": 0.902314305305481,
+        "z": 3.0999999046325684
+      },
+      "rotation": 0,
+      "horizon": 0
+    },
+    "instruction": "If the television is turned on, navigate to it. Otherwise, navigate to the sofa."
+  },
+  {
+    "ep_id": "attr_FloorPlan205",
+    "task": "attribute",
+    "scene": "FloorPlan205",
+    "scenario_id": "00004",
+    "distractor_type": "Sofa",
+    "agentPose": {
+      "position": {
+        "x": -1.5,
+        "y": 0.9011250734329224,
+        "z": 4.600000381469727
+      },
+      "rotation": 0,
+      "horizon": 0
+    },
+    "instruction": "If the television is turned on, navigate to it. Otherwise, navigate to the sofa."
+  },
+  {
+    "ep_id": "attr_FloorPlan206",
+    "task": "attribute",
+    "scene": "FloorPlan206",
+    "scenario_id": "00005",
+    "distractor_type": "Sofa",
+    "agentPose": {
+      "position": {
+        "x": -0.7999999523162842,
+        "y": 0.9009991884231567,
+        "z": 0.20000000298023224
+      },
+      "rotation": 180,
+      "horizon": 0
+    },
+    "instruction": "If the television is turned on, navigate to it. Otherwise, navigate to the sofa."
+  },
+  {
+    "ep_id": "attr_FloorPlan207",
+    "task": "attribute",
+    "scene": "FloorPlan207",
+    "scenario_id": "00006",
+    "distractor_type": "Sofa",
+    "agentPose": {
+      "position": {
+        "x": 1.100000023841858,
+        "y": 0.9009992480278015,
+        "z": 2.9000000953674316
+      },
+      "rotation": 180,
+      "horizon": 0
+    },
+    "instruction": "If the television is turned on, navigate to it. Otherwise, navigate to the sofa."
+  },
+  {
+    "ep_id": "attr_FloorPlan208",
+    "task": "attribute",
+    "scene": "FloorPlan208",
+    "scenario_id": "00007",
+    "distractor_type": "Sofa",
+    "agentPose": {
+      "position": {
+        "x": -2.3000001907348633,
+        "y": 0.9009991884231567,
+        "z": -2.0
+      },
+      "rotation": 0,
+      "horizon": 0
+    },
+    "instruction": "If the television is turned on, navigate to it. Otherwise, navigate to the sofa."
+  },
+  {
+    "ep_id": "attr_FloorPlan209",
+    "task": "attribute",
+    "scene": "FloorPlan209",
+    "scenario_id": "00008",
+    "distractor_type": "Sofa",
+    "agentPose": {
+      "position": {
+        "x": -2.5999999046325684,
+        "y": 0.9027014970779419,
+        "z": -4.5
+      },
+      "rotation": 90,
+      "horizon": 0
+    },
+    "instruction": "If the television is turned on, navigate to it. Otherwise, navigate to the sofa."
+  },
+  {
+    "ep_id": "attr_FloorPlan210",
+    "task": "attribute",
+    "scene": "FloorPlan210",
+    "scenario_id": "00009",
+    "distractor_type": "Sofa",
+    "agentPose": {
+      "position": {
+        "x": -0.9000000953674316,
+        "y": 0.9057542085647583,
+        "z": 2.0999999046325684
+      },
+      "rotation": 0,
+      "horizon": 0
+    },
+    "instruction": "If the television is turned on, navigate to it. Otherwise, navigate to the sofa."
+  },
+  {
+    "ep_id": "rel_FloorPlan2",
+    "task": "relation",
+    "scene": "FloorPlan2",
+    "scenario_id": "00001",
+    "spawn_seed": 3,
+    "agentPose": {
+      "position": {
+        "x": -1.100000023841858,
+        "y": 0.9009992480278015,
+        "z": 0.5
+      },
+      "rotation": 90,
+      "horizon": 0
+    },
+    "instruction": "Navigate to the pot that is on the counter top."
+  },
+  {
+    "ep_id": "rel_FloorPlan3",
+    "task": "relation",
+    "scene": "FloorPlan3",
+    "scenario_id": "00002",
+    "spawn_seed": 4,
+    "agentPose": {
+      "position": {
+        "x": 0.30000001192092896,
+        "y": 1.123205542564392,
+        "z": -0.19999992847442627
+      },
+      "rotation": 270,
+      "horizon": 0
+    },
+    "instruction": "Navigate to the pot that is on the counter top."
+  },
+  {
+    "ep_id": "rel_FloorPlan5",
+    "task": "relation",
+    "scene": "FloorPlan5",
+    "scenario_id": "00003",
+    "spawn_seed": 3,
+    "agentPose": {
+      "position": {
+        "x": 1.2999999523162842,
+        "y": 0.9009991884231567,
+        "z": 1.600000023841858
+      },
+      "rotation": 270,
+      "horizon": 0
+    },
+    "instruction": "Navigate to the pot that is on the counter top."
+  },
+  {
+    "ep_id": "rel_FloorPlan6",
+    "task": "relation",
+    "scene": "FloorPlan6",
+    "scenario_id": "00004",
+    "spawn_seed": 5,
+    "agentPose": {
+      "position": {
+        "x": -0.10000000149011612,
+        "y": 0.9009991884231567,
+        "z": -1.2000000476837158
+      },
+      "rotation": 0,
+      "horizon": 0
+    },
+    "instruction": "Navigate to the pot that is on the counter top."
+  },
+  {
+    "ep_id": "rel_FloorPlan8",
+    "task": "relation",
+    "scene": "FloorPlan8",
+    "scenario_id": "00005",
+    "spawn_seed": 3,
+    "agentPose": {
+      "position": {
+        "x": 0.7000000476837158,
+        "y": 0.9009991884231567,
+        "z": 0.9000000357627869
+      },
+      "rotation": 180,
+      "horizon": 0
+    },
+    "instruction": "Navigate to the pot that is on the counter top."
+  },
+  {
+    "ep_id": "rel_FloorPlan9",
+    "task": "relation",
+    "scene": "FloorPlan9",
+    "scenario_id": "00006",
+    "spawn_seed": 3,
+    "agentPose": {
+      "position": {
+        "x": -0.5,
+        "y": 0.9009991884231567,
+        "z": 0.800000011920929
+      },
+      "rotation": 90,
+      "horizon": 0
+    },
+    "instruction": "Navigate to the pot that is on the counter top."
+  },
+  {
+    "ep_id": "rel_FloorPlan10",
+    "task": "relation",
+    "scene": "FloorPlan10",
+    "scenario_id": "00007",
+    "spawn_seed": 3,
+    "agentPose": {
+      "position": {
+        "x": -3.6000001430511475,
+        "y": 0.9009992480278015,
+        "z": -2.299999952316284
+      },
+      "rotation": 90,
+      "horizon": 0
+    },
+    "instruction": "Navigate to the pot that is on the counter top."
+  },
+  {
+    "ep_id": "rel_FloorPlan12",
+    "task": "relation",
+    "scene": "FloorPlan12",
+    "scenario_id": "00008",
+    "spawn_seed": 3,
+    "agentPose": {
+      "position": {
+        "x": 1.4000000953674316,
+        "y": 0.9799999594688416,
+        "z": -0.800000011920929
+      },
+      "rotation": 270,
+      "horizon": 0
+    },
+    "instruction": "Navigate to the pot that is on the counter top."
+  },
+  {
+    "ep_id": "rel_FloorPlan13",
+    "task": "relation",
+    "scene": "FloorPlan13",
+    "scenario_id": "00009",
+    "spawn_seed": 3,
+    "agentPose": {
+      "position": {
+        "x": -2.0,
+        "y": 0.8995019197463989,
+        "z": 3.700000047683716
+      },
+      "rotation": 0,
+      "horizon": 0
+    },
+    "instruction": "Navigate to the pot that is on the counter top."
+  }
+]

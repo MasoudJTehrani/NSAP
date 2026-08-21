@@ -1,0 +1,1 @@
+[{"ep_id": "attr_FloorPlan201", "task": "attribute", "scene": "FloorPlan201", "scenario_id": "00000", "distractor_type": "Sofa", "agentPose": {"position": {"x": -4.300000190734863, "y": 0.9026566743850708, "z": 4.300000190734863}, "rotation": 0, "horizon": 0}, "instruction": "If the television is turned on, navigate to it. Otherwise, navigate to the sofa."}]

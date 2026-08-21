@@ -237,11 +237,17 @@ def _get_clean_probs(
 # ──────────────────────────────────────────────────────────────────────────────
 # Fix-B: Expectation-Over-Crops — mimic GroundingDINO detection boxes
 # ──────────────────────────────────────────────────────────────────────────────
-def _eot_crop_object(patched, mask, bbox, alpha, scale_jitter):
+def _eot_crop_object(patched, mask, bbox, alpha, scale_jitter, whiten=True):
     """Crop the patched frame to a JITTERED version of bbox (mimicking a detector
-    box: random scale + centre shift), whiten background -> a cropped object view.
-    Differentiable through the slice (grads flow to patch pixels inside the crop).
-    Returns None if the crop is degenerate."""
+    box: random scale + centre shift). Differentiable through the slice (grads flow
+    to patch pixels inside the crop). Returns None if the crop is degenerate.
+
+    whiten=True  (category): whiten background by the instance mask -> a cropped
+                 object view, matching the category head's full-frame eval forward.
+    whiten=False (attribute): return the RAW bbox crop with no whitening. The model's
+                 unary forward is extract_single_object(bbox_mask)+crop_to_bbox, which
+                 is exactly a raw bbox crop (outside-bbox pixels are cropped away), so
+                 this is what the planner grounds attributes through."""
     import random
     from functions.attack.preprocess import extract_single_object_torch
     H, W = patched.shape[0], patched.shape[1]
@@ -254,6 +260,8 @@ def _eot_crop_object(patched, mask, bbox, alpha, scale_jitter):
     nx2 = int(min(W, cx + bw * s / 2)); ny2 = int(min(H, cy + bh * s / 2))
     if nx2 - nx1 < 4 or ny2 - ny1 < 4:
         return None
+    if not whiten:
+        return patched[ny1:ny2, nx1:nx2, :]
     m = mask.squeeze(-1) if mask.dim() == 3 else mask
     return extract_single_object_torch(patched[ny1:ny2, nx1:nx2, :],
                                        m[ny1:ny2, nx1:nx2], alpha=alpha)
@@ -539,13 +547,12 @@ def train_patch(
                 subj_bbox = inst['subj_bbox']
                 obj_bbox  = inst['obj_bbox']
 
-                binary_kws  = inst_binary_kws
-                correct_idx = next(
-                    (i for i, k in enumerate(binary_kws)
-                     if config.target_relation.lower() in k.lower()), None
-                )
-                if correct_idx is None:
-                    continue
+                # RELATION: match the ESCA planner's per-relation 2-way contrast
+                # [rel, "not rel"] (esca.py binary grounding), NOT multi-way over
+                # RELATION_WORDS. Suppressing the relation logit below "not rel" is
+                # what deletes the (subject, rel, object) edge at deployment.
+                binary_kws  = [config.target_relation, f"not {config.target_relation}"]
+                correct_idx = 0
 
                 ph, pw    = compute_patch_size(subj_bbox, config.coverage_ratio)
                 cx, cy    = anchor_center(anchor, subj_bbox, ph, pw)
@@ -593,8 +600,12 @@ def train_patch(
                     kws         = inst_cat_kws
                     target_str  = config.target_category
                 else:
+                    # ATTRIBUTE: ground the SAME way the ESCA planner does — an independent
+                    # 2-way contrast [attr, "not attr"] per attribute (esca.py:585), NOT
+                    # multi-way over the whole ATTRIBUTE_WORDS vocab. Suppressing the
+                    # attribute logit below "not attr" is exactly what flips it at deployment.
                     enc         = vine_model.clip_unary_model
-                    kws         = inst_unary_kws
+                    kws         = [config.target_attribute, f"not {config.target_attribute}"]
                     target_str  = config.target_attribute
 
                 correct_idx = next(
@@ -611,19 +622,30 @@ def train_patch(
                     offset_range=config.offset_range,
                 )
 
-                # Category/attribute heads: eval classifies on the FULL frame with
-                # background whitened (no bbox crop). Mirror that here so the patch
-                # is optimised against the same input it is scored on.
+                # Category head classifies on the FULL frame (background whitened, no
+                # crop) — its validated eval forward. The ATTRIBUTE (unary) head instead
+                # matches the MODEL's forward (llava_clip_model_v3:205-210):
+                # extract_single_object(bbox_mask)+crop_to_bbox == a RAW bbox crop, since
+                # outside-bbox pixels are cropped away. The ESCA planner grounds
+                # attributes through that cropped bbox forward, so optimising the
+                # full-frame view instead INVERTS the gradient (the patch raises the
+                # attribute score at deployment). proc (full frame) still feeds preserve.
                 proc = extract_single_object_torch(patched, mask, alpha=vine_model.config.alpha)
+                if config.attack_mode == 'attribute':
+                    proc_attack = crop_image_contain_bboxes_torch(patched, [bbox])
+                else:
+                    proc_attack = proc
 
-                scores = _clip_scores(vine_model, enc, proc, kws, device, config.clip_image_size)
+                scores = _clip_scores(vine_model, enc, proc_attack, kws, device, config.clip_image_size)
                 attack_terms = [l_attack_cw(scores, correct_idx, config.kappa)]
                 # Fix-B EOT: also flip SGClip across jittered detector-like crops, so
                 # the patch transfers to ESCA's live GroundingDINO boxes (not just the
                 # full-frame view). Each crop is differentiable through the patch.
+                # Attribute crops are RAW (whiten=False) to match the model's bbox crop.
                 for _k in range(config.eot_crops):
                     obj_k = _eot_crop_object(patched, mask, bbox, vine_model.config.alpha,
-                                             config.eot_scale_jitter)
+                                             config.eot_scale_jitter,
+                                             whiten=(config.attack_mode != 'attribute'))
                     if obj_k is None:
                         continue
                     s_k = _clip_scores(vine_model, enc, obj_k, kws, device, config.clip_image_size)
@@ -784,13 +806,19 @@ def _filter_by_clean_prediction(
                                        config.target_category, min_conf=config.min_target_conf,
                                        exact=True)
                 else:
-                    # attribute: require BOTH the target category (confidently) AND the attribute
+                    # attribute: require the target CATEGORY (full-frame view, its
+                    # validated forward) AND the target ATTRIBUTE grounded through the
+                    # model's unary forward — a RAW bbox crop (llava_clip_model_v3:205-210).
+                    # This keeps exactly the instances the ESCA planner reads as having
+                    # the attribute, so filter, loss and deployment share ONE forward.
+                    proc_attr = crop_image_contain_bboxes_torch(frame, [inst['bbox']])
                     ok = (
                         _head_top1_ok(vine_model.clip_cate_model,  proc, consts,
                                       config.target_category, min_conf=config.min_target_conf,
                                       exact=True)
                         and
-                        _head_top1_ok(vine_model.clip_unary_model, proc, spec.get('unary_kws', []),
+                        _head_top1_ok(vine_model.clip_unary_model, proc_attr,
+                                      [config.target_attribute, f"not {config.target_attribute}"],
                                       config.target_attribute)
                     )
 
@@ -814,7 +842,8 @@ def _filter_by_clean_prediction(
                 )
                 crop = crop_image_contain_bboxes_torch(proc, [subj_bbox, obj_bbox])
                 ok = _head_top1_ok(vine_model.clip_binary_model, crop,
-                                   spec.get('binary_kws', []), config.target_relation)
+                                   [config.target_relation, f"not {config.target_relation}"],
+                                   config.target_relation)
 
             if ok:
                 kept.append(inst)

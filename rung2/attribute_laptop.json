@@ -1,0 +1,7 @@
+{
+  "mode": "attribute", "target_category": "Laptop", "predicate": "open",
+  "scenes": [201,202,203,204,205,206,207,208,209,210,211,212,213,214,215],
+  "spawn_seed": 3,
+  "framing": {"dists": [0.5,0.7,0.9], "views_per_dist": 4, "tol": 0.3},
+  "resolution": 600, "min_area": 600, "seed": 0
+}

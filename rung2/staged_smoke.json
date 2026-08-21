@@ -1,0 +1,36 @@
+[
+  {
+    "ep_id": "attr_FloorPlan201",
+    "task": "attribute",
+    "scene": "FloorPlan201",
+    "scenario_id": "00000",
+    "distractor_type": "Sofa",
+    "agentPose": {
+      "position": {
+        "x": -4.300000190734863,
+        "y": 0.9026566743850708,
+        "z": 4.300000190734863
+      },
+      "rotation": 0,
+      "horizon": 0
+    },
+    "instruction": "If the television is turned on, navigate to it. Otherwise, navigate to the sofa."
+  },
+  {
+    "ep_id": "rel_FloorPlan2",
+    "task": "relation",
+    "scene": "FloorPlan2",
+    "scenario_id": "00001",
+    "spawn_seed": 3,
+    "agentPose": {
+      "position": {
+        "x": -1.100000023841858,
+        "y": 0.9009992480278015,
+        "z": 0.5
+      },
+      "rotation": 90,
+      "horizon": 0
+    },
+    "instruction": "Navigate to the pot that is on the counter top."
+  }
+]
