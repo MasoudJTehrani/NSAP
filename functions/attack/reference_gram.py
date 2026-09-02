@@ -55,6 +55,18 @@ def _extract_vgg_grams(
     return grams
 
 
+def _fingerprint(samples) -> str:
+    """Cheap content fingerprint of the crops used, so a Gram cache from a DIFFERENT
+    dataset (e.g. after the merge) is not silently reused."""
+    import hashlib
+    h = hashlib.sha1()
+    for inst in samples:
+        b = inst.get('bbox', {})
+        h.update(f"{inst.get('_png_path', '')}|{b.get('x1')},{b.get('y1')},"
+                 f"{b.get('x2')},{b.get('y2')};".encode())
+    return h.hexdigest()
+
+
 def compute_reference_grams(
     instance_list: list,
     n_instances: int,
@@ -75,9 +87,15 @@ def compute_reference_grams(
     Returns:
         List of 3 Gram tensors: [C1×C1, C2×C2, C3×C3] on CPU
     """
+    samples = instance_list[:n_instances]
+    fp = _fingerprint(samples)
+
     if cache_path and os.path.exists(cache_path):
-        print(f"Loading cached reference Gram from {cache_path}")
-        return torch.load(cache_path, map_location='cpu')
+        cached = torch.load(cache_path, map_location='cpu')
+        if isinstance(cached, dict) and cached.get('fingerprint') == fp:
+            print(f"Loading cached reference Gram from {cache_path}")
+            return cached['grams']
+        print(f"Reference Gram cache at {cache_path} is stale (instances changed) -- recomputing.")
 
     from functions.attack.preprocess import extract_single_object_torch, crop_image_contain_bboxes_torch
     from functions.attack.data import load_frame as _load_frame
@@ -87,7 +105,6 @@ def compute_reference_grams(
     for p in vgg.parameters():
         p.requires_grad_(False)
 
-    samples = instance_list[:n_instances]
     print(f"Computing reference Gram over {len(samples)} instances...")
 
     # Accumulate Gram matrices over the crops that survive preprocessing.
@@ -128,7 +145,7 @@ def compute_reference_grams(
 
     if cache_path:
         os.makedirs(os.path.dirname(cache_path), exist_ok=True)
-        torch.save(reference, cache_path)
+        torch.save({'grams': reference, 'fingerprint': fp}, cache_path)
         print(f"Saved reference Gram to {cache_path}")
 
     return reference

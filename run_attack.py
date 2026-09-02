@@ -2,22 +2,23 @@
 NSAP — Neuro-Symbolic Adversarial Patch
 Entry point for training and evaluating adversarial patches against VINE.
 
-Data source: the self-contained SceneGraphBench (AI2-THOR) sim dataset, passed
-via --sim-data <dataset dir> (required). See SceneGraphBench/ to generate one.
+Data source: the self-contained SceneGraphBench (AI2-THOR) sim dataset. Get it with
+`python NSAP.py --with-dataset` (downloads to dataset/sim/, used automatically) or
+generate one from the SceneGraphBench/ submodule, then pass it with --sim-data <dir>.
 
 Usage examples
 --------------
-# Category attack on 'Fridge', quick test (50 steps):
-python run_attack.py --sim-data <dataset> --mode category --target Fridge --steps 50
+# Category attack on 'Toaster', quick test (50 steps):
+python run_attack.py --sim-data <dataset> --mode category --target Toaster --steps 50
 
-# Attribute attack on 'Microwave' (open/closed etc.), full run:
-python run_attack.py --sim-data <dataset> --mode attribute --target Microwave --attribute open
+# Attribute attack: a television that is 'displaying' (screen on):
+python run_attack.py --sim-data <dataset> --mode attribute --target Television --attribute displaying
 
-# Relation attack ('next to'):
-python run_attack.py --sim-data <dataset> --mode relation --relation "next to" --target Mug
+# Relation attack: a pot that is 'on' a surface (staged scenes only):
+python run_attack.py --sim-data dataset/sim --mode relation --relation "on" --target Pot --data-source pot
 
 # Evaluate a saved patch:
-python run_attack.py --sim-data <dataset> --eval --patch output/patches/category_Fridge/category_Fridge_final.pt
+python run_attack.py --sim-data <dataset> --eval --patch output/patches/category_Toaster/category_Toaster_final.pt
 """
 
 import os
@@ -67,8 +68,9 @@ def run_train(args):
     from functions.attack.train import train_patch, AttackConfig
 
     if not args.sim_data:
-        raise SystemExit("--sim-data <dataset dir> is required "
-                         "(the YouTube/ESCA video data source has been removed).")
+        raise SystemExit("--sim-data <dataset dir> is required. Get the dataset with "
+                         "`python NSAP.py --with-dataset` (-> dataset/sim/) or generate "
+                         "one from the SceneGraphBench/ submodule.")
 
     attack_dir = _attack_subdir(args.output_dir, args.mode, args.target, args.relation, args.attribute)
 
@@ -95,6 +97,7 @@ def run_train(args):
         max_clips        = args.max_clips,
         min_target_conf  = args.min_target_conf,
         sim_data_dir     = args.sim_data,
+        data_source      = args.data_source,
         use_all_data     = args.all_data,
         init_patch_path  = args.init_patch,
         only_scenario    = args.only_scenario,
@@ -154,8 +157,8 @@ def run_eval(args):
         config.sim_data_dir = args.sim_data
 
     if not getattr(config, 'sim_data_dir', ''):
-        raise SystemExit("--sim-data <dataset dir> is required "
-                         "(the YouTube/ESCA video data source has been removed).")
+        raise SystemExit("--sim-data <dataset dir> is required. Get it with "
+                         "`python NSAP.py --with-dataset` or generate one from SceneGraphBench/.")
 
     ph, pw = ckpt['w'].shape[1], ckpt['w'].shape[2]
     patch  = AdversarialPatch(ph, pw, torch.device(device))
@@ -172,6 +175,7 @@ def run_eval(args):
         split            = None if _only else 'test',
         max_clips        = getattr(config, 'max_clips', 0),
         only_scenarios   = _only,
+        data_source      = getattr(config, 'data_source', ''),
     )
 
     test_items = [dataset[i] for i in range(len(dataset))]
@@ -187,10 +191,8 @@ def run_eval(args):
         test_items = test_items[::step]
     print(f"  [sim] per-frame eval: {len(test_items)} frame-samples")
 
-    # Post-explosion each sample is a single frame, so these are frame-sample
-    # counts (kept for the results JSON, which stores both fields).
-    n_loaded     = sum(1 for it in test_items if it is not None)
-    total_frames = sum(len(it['frames']) for it in test_items if it is not None)
+    # Post-explosion each sample is a single frame, so n_loaded is a frame-sample count.
+    n_loaded = sum(1 for it in test_items if it is not None)
 
     print(f"\n=== Test set ===")
     print(f"Frame-samples                : {len(test_items)}")
@@ -224,64 +226,78 @@ def run_eval(args):
         'relation':  iso_results['total_relation_changes'],
     }
     n_obj = iso_results['total_target_objects']
-    denom = max(n_obj, 1)
+    n_rel = iso_results.get('total_target_relations', 0)
+    # Per-head denominator: category/attribute changes are counted per target
+    # OBJECT, relation changes per target EDGE. Normalising the relation row by
+    # objects (subjects) is what made it read >100%; by edges it equals flip rate.
+    def _rate(head: str, ct: int) -> str:
+        d = n_rel if head == 'relation' else n_obj
+        return f"{ct/d:.0%}" if d > 0 else "0%"
     attacked_ct = head_ct[attacked_label] + (
         iso_results['total_disappeared'] if mode == 'category' else 0)
 
-    print(f"Target objects evaluated     : {n_obj}  "
-          f"(mean {iso_results['mean_n_target_objects']:.2f} / clip)")
-    print(f"Changes on those objects (count, % of {n_obj} objects):")
+    _basis = f"{n_obj} objects" + (f", {n_rel} relation edges" if mode == 'relation' else "")
+    print(f"Target objects evaluated     : {n_obj}"
+          + (f"   ({n_rel} relation edges)" if mode == 'relation' else ""))
+    print(f"Changes on target ({_basis}):")
     print(f"  [attacked]   {attacked_label:9s}: {head_ct[attacked_label]:4d}  "
-          f"({head_ct[attacked_label]/denom:.1%})   ← higher = stronger attack")
+          f"({_rate(attacked_label, head_ct[attacked_label])})   ← higher = stronger attack")
     for h in collateral_heads:
-        print(f"  [collateral] {h:9s}: {head_ct[h]:4d}  ({head_ct[h]/denom:.1%})"
+        print(f"  [collateral] {h:9s}: {head_ct[h]:4d}  ({_rate(h, head_ct[h])})"
               f"   ← lower = better isolation")
     print(f"  disappeared          : {iso_results['total_disappeared']:4d}  "
-          f"({iso_results['total_disappeared']/denom:.1%})")
+          f"({_rate('category', iso_results['total_disappeared'])})")
     print(f"  TOTAL changes        : {iso_results['total_changes']:4d}")
 
     print(f"Isolation score:")
     _pool = iso_results['pooled_isolation_score']
     if _pool is None:
         _why = "no target objects found" if n_obj == 0 else "attack changed nothing on the target"
-        print(f"  pooled    : n/a  ({_why} — nothing to isolate)")
+        print(f"  pooled    : n/a  ({_why}, nothing to isolate)")
     else:
         print(f"  pooled    : {_pool:.1%}  "
               f"({attacked_ct}/{iso_results['total_changes']} of ALL changes hit the attacked head)")
-    _perclip = iso_results['mean_isolation_score']
-    if _perclip is None:
-        print(f"  per-clip  : n/a  (no clip had any change to attribute)")
-    else:
-        print(f"  per-clip  : {_perclip:.1%}  (avg over clips that HAD changes)")
 
-    # Save results as JSON in the same directory as the patch file
+    # Save results as JSON in the same directory as the patch file.
+    # "_fields" documents every metric so the JSON is self-explaining.
     results = {
+        "_fields": {
+            "attack_mode": "which head was attacked: category | attribute | relation",
+            "target": "attacked category (category/attribute) or relation predicate (relation)",
+            "n_frames_requested": "frame-samples selected for the test split",
+            "n_frames_loaded": "frame-samples that decoded (differs from requested only on a read error)",
+            "n_frames_with_clean_target": "frames where the CLEAN model grounded >=1 target fact (effective sample size, NOT ground-truth presence)",
+            "flip_rate": "HEADLINE attack strength = n_flipped / n_total",
+            "n_total": "target FACTS the clean model grounded: objects (category/attribute) or relation EDGES (relation)",
+            "n_flipped": "of n_total, how many the patch changed (relation: on-edge deleted or redirected)",
+            "n_objects_patched": "distinct objects the isolation pass patched (relation: distinct SUBJECT pots; equals n_total for category/attribute)",
+            "n_target_relations": "target relation EDGES (relation mode only; reconciles with n_total)",
+            "total_category_changes": "target objects whose CATEGORY changed after patching",
+            "total_attribute_changes": "target objects whose ATTRIBUTE changed",
+            "total_relation_changes": "target edges whose RELATION changed",
+            "total_disappeared": "target objects that left the scene graph entirely (category attack: counts as success; otherwise a confound, tracked apart)",
+            "total_changes": "sum of the four change buckets above",
+            "pooled_isolation_score": "fraction of ALL changes that hit the attacked head (1.0 = surgical; null = nothing changed)",
+        },
         "patch":        args.patch,
         "attack_mode":  config.attack_mode,
         "target":       target,
-        "n_test_clips_requested": len(test_items),
-        "n_test_clips_loaded":    n_loaded,
-        "total_frames":           total_frames,
-        # Flip rate
+        "n_frames_requested":         len(test_items),
+        "n_frames_loaded":            n_loaded,
+        "n_frames_with_clean_target": flip_results.get('n_clips_with_targets'),
+        # ── attack strength ──
         "flip_rate":    flip_results['flip_rate'],
         "n_flipped":    flip_results['n_flipped'],
         "n_total":      flip_results['n_total'],
-        "n_clips_with_targets": flip_results.get('n_clips_with_targets'),
-        # Edit distance — raw counts (pooled)
-        "total_target_objects":    iso_results['total_target_objects'],
+        # ── isolation (scene-graph edit distance) ──
+        "n_objects_patched":       iso_results['total_target_objects'],
+        "n_target_relations":      iso_results.get('total_target_relations', 0),
         "total_category_changes":  iso_results['total_category_changes'],
         "total_attribute_changes": iso_results['total_attribute_changes'],
         "total_relation_changes":  iso_results['total_relation_changes'],
         "total_disappeared":       iso_results['total_disappeared'],
         "total_changes":           iso_results['total_changes'],
         "pooled_isolation_score":  iso_results['pooled_isolation_score'],
-        # Edit distance — per-clip means (legacy)
-        "mean_n_target_objects":      iso_results['mean_n_target_objects'],
-        "mean_category_change_rate":  iso_results['mean_category_change_rate'],
-        "mean_attribute_change_rate": iso_results['mean_attribute_change_rate'],
-        "mean_relation_change_rate":  iso_results['mean_relation_change_rate'],
-        "mean_disappear_rate":        iso_results['mean_disappear_rate'],
-        "mean_isolation_score":       iso_results['mean_isolation_score'],
     }
 
     patch_dir  = os.path.dirname(os.path.abspath(args.patch))
@@ -305,8 +321,8 @@ def main():
     parser.add_argument("--mode",   default="category",
                         choices=["category", "attribute", "relation"],
                         help="Attack mode")
-    parser.add_argument("--target", default="Fridge",
-                        help="Target category string (AI2-THOR sim, e.g. 'Fridge', 'Microwave', 'Mug')")
+    parser.add_argument("--target", default="Toaster",
+                        help="Target category string (AI2-THOR sim, e.g. 'Toaster', 'Pot', 'Television')")
     parser.add_argument("--relation",  default="next to",
                         help="Target relation string for --mode relation (e.g. 'next to', 'on')")
     parser.add_argument("--attribute", default="",
@@ -342,11 +358,15 @@ def main():
                              "cost ~tens of MB; cap this on machines with limited RAM.")
     parser.add_argument("--min-target-conf", type=float, default=0.0, dest="min_target_conf",
                         help="Min VINE softmax confidence for the target category to accept an "
-                             "object as a target (0 = off). Drops weakly-classified targets "
-                             "(e.g. a table VINE calls 'person' at 0.3). Try 0.5.")
+                             "object as a target (0 = off). Drops weakly-classified targets. "
+                             "Try 0.5.")
     parser.add_argument("--sim-data", default="", dest="sim_data",
-                        help="REQUIRED: path to the SceneGraphBench (AI2-THOR) dataset to "
-                             "train/eval on. This is NSAP's only data source.")
+                        help="Path to the SceneGraphBench (AI2-THOR) dataset to train/eval on "
+                             "(NSAP's only data source). Defaults to dataset/sim/ if present "
+                             "(from `python NSAP.py --with-dataset`).")
+    parser.add_argument("--data-source", default="", dest="data_source",
+                        help="Restrict to scenarios from one merge source (the 'source' tag in "
+                             "the unified manifest, e.g. 'pot' for the staged relation scenes).")
     parser.add_argument("--all-data", action="store_true", dest="all_data",
                         help="Train on ALL sim scenarios (no train/test split).")
     parser.add_argument("--init-patch", default="", dest="init_patch",
@@ -366,6 +386,14 @@ def main():
     parser.add_argument("--output-dir", default="output/patches", dest="output_dir")
 
     args = parser.parse_args()
+
+    # Auto-use the downloaded dataset only when it is itself a single dataset root
+    # (has manifest.json). A multi-dataset snapshot (dataset/sim/<name>/...) must be
+    # selected explicitly, e.g. --sim-data dataset/sim/attribute_tv.
+    if not args.sim_data:
+        _default_sim = os.path.join(os.path.dirname(__file__), "dataset", "sim")
+        if os.path.isfile(os.path.join(_default_sim, "manifest.json")):
+            args.sim_data = _default_sim
 
     if args.eval:
         if not args.patch:

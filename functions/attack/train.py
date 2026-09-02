@@ -81,8 +81,8 @@ class AttackConfig:
     max_clips: int = 0
 
     # Minimum VINE softmax confidence for the target CATEGORY to accept an object
-    # as a target (0 = off). Drops objects VINE only weakly calls "person" (e.g. a
-    # table misclassified at 0.3), in both training and eval. Applied to the
+    # as a target (0 = off). Drops objects VINE classifies as the target only
+    # weakly (low softmax confidence), in both training and eval. Applied to the
     # category head (relation: the subject's category).
     min_target_conf: float = 0.0
 
@@ -90,6 +90,10 @@ class AttackConfig:
     # data source. Frames are PNGs and labels are sim ground truth
     # (see functions/attack/sim_data.py::SimAttackDataset). Required.
     sim_data_dir: str = ''
+
+    # Optional: restrict to scenarios from ONE merge source (the 'source' tag in the
+    # unified manifest, e.g. 'pot' for the staged relation scenes). '' = all sources.
+    data_source: str = ''
 
     # Two-phase chameleon experiment (sim only):
     #   use_all_data    — train on ALL scenarios (no train/test split).
@@ -196,6 +200,19 @@ from functions.attack.preprocess import clip_scores as _clip_scores
 from functions.attack.data import load_frame as _load_frame
 
 
+def _target_index(kws: List[str], target: str):
+    """Index of `target` in `kws`: exact match first, else the positive (non-'not ')
+    substring match, so the 2-way contrast negation ('not displaying') is never picked."""
+    t = target.lower()
+    for i, c in enumerate(kws):
+        if c.lower() == t:
+            return i
+    for i, c in enumerate(kws):
+        if t in c.lower() and not c.lower().startswith("not "):
+            return i
+    return None
+
+
 def _get_clean_probs(
     vine_model,
     clip_encoder,
@@ -208,6 +225,7 @@ def _get_clean_probs(
     is_pair: bool = False,
     obj_mask=None,
     obj_bbox=None,
+    crop_bbox=None,
 ) -> torch.Tensor:
     """
     Run the clean (un-patched) forward pass to obtain reference probabilities
@@ -227,8 +245,11 @@ def _get_clean_probs(
             proc    = extract_object_subject_torch(frame.to(device), mask.to(device), obj_mask.to(device),
                                                    alpha=alpha, white_alpha=white_alpha)
             clip_in = crop_image_contain_bboxes_torch(proc, [bbox, obj_bbox])
+        elif crop_bbox is not None:
+            # unary/attribute head deployment forward: a RAW bbox crop (no whitening)
+            clip_in = crop_image_contain_bboxes_torch(frame.to(device), [crop_bbox])
         else:
-            # category/attribute head: eval uses the FULL frame, not a bbox crop
+            # category head: eval uses the FULL frame (whitened), not a bbox crop
             clip_in = extract_single_object_torch(frame.to(device), mask.to(device), alpha=alpha)
         scores = _clip_scores(vine_model, clip_encoder, clip_in, keywords, device, clip_image_size)
         return torch.softmax(scores, dim=-1)
@@ -311,6 +332,11 @@ def train_patch(
     np.random.seed(_seed)
     torch.manual_seed(_seed)
     torch.cuda.manual_seed_all(_seed)
+    # cudnn determinism (safe: no crash risk). Bit-exact GPU repro would ALSO need
+    # torch.use_deterministic_algorithms(True), which we do not force because some
+    # CUDA ops lack deterministic kernels and would raise at runtime.
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
     # Freeze the VINE model — only the patch is trainable
     for p in vine_model.parameters():
@@ -335,11 +361,17 @@ def train_patch(
         split=_split,
         max_clips=config.max_clips,
         only_scenarios=_only,
+        data_source=getattr(config, 'data_source', ''),
     )
 
     if config.attack_mode == 'relation':
+        # Scope to the target SUBJECT category at build time. On a unified dataset this
+        # avoids building every 'on' relation in every scene (the clean-prediction filter
+        # would then run ~12k VINE forwards); result-identical since that filter already
+        # keeps only subject==target_category. Pass '' to keep all subjects.
         instances = dataset.build_relation_instance_list(
             target_relation=config.target_relation,
+            subject_category=config.target_category,
         )
     else:
         instances = dataset.build_instance_list(
@@ -517,6 +549,23 @@ def train_patch(
 
     os.makedirs(config.output_dir, exist_ok=True)
 
+    def _preserve_obj_head(enc, kws, frame, mask, bbox, patched, crop: bool):
+        """Isolation term for ONE single-object head, through ITS deployment forward:
+        crop=True -> raw bbox crop (unary/attribute head); crop=False -> full-frame
+        whitened (category head). KL(clean || patched). Zero when the head has no kws."""
+        if not kws:
+            return torch.tensor(0.0, device=device)
+        if crop:
+            proc_p = crop_image_contain_bboxes_torch(patched, [bbox])
+            p_orig = _get_clean_probs(vine_model, enc, frame, mask, bbox, kws,
+                                      device, config.clip_image_size, crop_bbox=bbox)
+        else:
+            proc_p = extract_single_object_torch(patched, mask, alpha=vine_model.config.alpha)
+            p_orig = _get_clean_probs(vine_model, enc, frame, mask, bbox, kws,
+                                      device, config.clip_image_size)
+        s_pat = _clip_scores(vine_model, enc, proc_p, kws, device, config.clip_image_size)
+        return l_preserve_kl(p_orig, torch.softmax(s_pat, dim=-1))
+
     # ── Main training loop ────────────────────────────────────────────────────
     print(f"\n=== Training patch ({config.num_steps} steps) ===")
 
@@ -530,7 +579,6 @@ def train_patch(
         step_gram     = torch.tensor(0.0, device=device)
         step_tv       = torch.tensor(0.0, device=device)
         step_dino_l   = torch.tensor(0.0, device=device)
-        step_content  = torch.tensor(0.0, device=device)
         step_preserve = torch.tensor(0.0, device=device)
 
         for inst in batch:
@@ -538,7 +586,6 @@ def train_patch(
             inst_spec       = inst['gpt_spec']
             inst_cat_kws    = inst_spec.get('consts',     [])
             inst_unary_kws  = inst_spec.get('unary_kws',  [])
-            inst_binary_kws = inst_spec.get('binary_kws', [])
 
             if config.attack_mode == 'relation':
                 frame     = _load_frame(inst).to(device)
@@ -575,20 +622,13 @@ def train_patch(
                 )
                 step_attack = step_attack + l_attack_cw(scores, correct_idx, config.kappa)
 
-                # Preservation: category and attribute heads of the subject — these
-                # are classified on the FULL frame in eval (no crop).
-                for enc, kws in [
-                    (vine_model.clip_cate_model,  inst_cat_kws),
-                    (vine_model.clip_unary_model, inst_unary_kws),
-                ]:
-                    if not kws:
-                        continue
-                    proc_p = extract_single_object_torch(patched, subj_mask, alpha=vine_model.config.alpha)
-                    s_pat  = _clip_scores(vine_model, enc, proc_p, kws, device, config.clip_image_size)
-                    p_pat  = torch.softmax(s_pat, dim=-1)
-                    p_orig = _get_clean_probs(vine_model, enc, frame, inst['subj_mask'],
-                                              subj_bbox, kws, device, config.clip_image_size)
-                    step_preserve = step_preserve + l_preserve_kl(p_orig, p_pat)
+                # Isolation: preserve the subject's OTHER two heads, each through ITS
+                # deployment forward -- category on the full frame, the unary/attribute
+                # head on a raw bbox crop (not the full frame).
+                step_preserve = step_preserve + _preserve_obj_head(
+                    vine_model.clip_cate_model,  inst_cat_kws,   frame, subj_mask, subj_bbox, patched, crop=False)
+                step_preserve = step_preserve + _preserve_obj_head(
+                    vine_model.clip_unary_model, inst_unary_kws, frame, subj_mask, subj_bbox, patched, crop=True)
 
             else:
                 frame = _load_frame(inst).to(device)
@@ -608,9 +648,7 @@ def train_patch(
                     kws         = [config.target_attribute, f"not {config.target_attribute}"]
                     target_str  = config.target_attribute
 
-                correct_idx = next(
-                    (i for i, c in enumerate(kws) if target_str.lower() in c.lower()), None
-                )
+                correct_idx = _target_index(kws, target_str)
                 if correct_idx is None:
                     continue
 
@@ -652,46 +690,42 @@ def train_patch(
                     attack_terms.append(l_attack_cw(s_k, correct_idx, config.kappa))
                 step_attack = step_attack + torch.stack(attack_terms).mean()
 
-                # Preservation: the other two heads (same full-frame input)
-                preserve_heads = [
-                    (vine_model.clip_cate_model,   inst_cat_kws)   if config.attack_mode == 'attribute'
-                    else (vine_model.clip_unary_model, inst_unary_kws),
-                    (vine_model.clip_binary_model, inst_binary_kws),
-                ]
-                for penc, pkws in preserve_heads:
-                    if not pkws:
-                        continue
-                    s_pat  = _clip_scores(vine_model, penc, proc, pkws, device, config.clip_image_size)
-                    p_pat  = torch.softmax(s_pat, dim=-1)
-                    p_orig = _get_clean_probs(vine_model, penc, frame, inst['mask'],
-                                              bbox, pkws, device, config.clip_image_size)
-                    step_preserve = step_preserve + l_preserve_kl(p_orig, p_pat)
+                # Isolation: preserve the OTHER single-object head through ITS deployment
+                # forward. Attribute attack -> preserve category (full frame); category
+                # attack -> preserve the unary/attribute head (raw bbox crop). The binary
+                # (relation) head scores object PAIRS, which a single-object instance
+                # cannot form, so it is not trained here (eval still measures it).
+                if config.attack_mode == 'attribute':
+                    step_preserve = step_preserve + _preserve_obj_head(
+                        vine_model.clip_cate_model, inst_cat_kws, frame, mask, bbox, patched, crop=False)
+                else:  # category attack
+                    step_preserve = step_preserve + _preserve_obj_head(
+                        vine_model.clip_unary_model, inst_unary_kws, frame, mask, bbox, patched, crop=True)
 
-            # Gram + DINO naturalness (need VGG16 / DINOv2 loaded)
+            # DINO naturalness is per-instance (depends on THIS patched frame), so it
+            # stays in the loop. Gram/TV/content are patch-only and are computed once
+            # per step below, not n identical times here.
             if config.use_chameleon:
-                patch_px = patch.pixels_hwc  # [H, W, 3]
-                step_gram   = step_gram   + l_chameleon_gram(patch_px, reference_grams, vgg, vgg_mean, vgg_std)
                 step_dino_l = step_dino_l + l_chameleon_dino(
                     patched, _patch_bbox_from_anchor(cx, cy, ph, pw, patched.shape),
                     dino_model, dino_preprocess_torch,
                 )
 
-            # TV smoothness + appearance/content anchor — network-free, so they run
-            # independent of use_chameleon (object-init camouflage = content [+ TV],
-            # without the VGG/DINO stack).
-            if config.lambda_tv > 0:
-                step_tv = step_tv + l_chameleon_tv(patch.pixels_hwc)
-            if config.lambda_content > 0 and content_ref is not None:
-                step_content = step_content + l_chameleon_content(patch.pixels_hwc, content_ref)
-
         n = len(batch)
+        # Patch-only terms (gram/tv/content) depend on the patch alone, not the
+        # instances, so compute them ONCE per step instead of n identical times.
+        gram_once    = (l_chameleon_gram(patch.pixels_hwc, reference_grams, vgg, vgg_mean, vgg_std)
+                        if config.use_chameleon else step_gram)
+        tv_once      = l_chameleon_tv(patch.pixels_hwc) if config.lambda_tv > 0 else step_tv
+        content_once = (l_chameleon_content(patch.pixels_hwc, content_ref)
+                        if (config.lambda_content > 0 and content_ref is not None) else None)
         loss = total_loss(
             attack_loss   = step_attack   / n,
-            gram_loss     = step_gram     / n,
-            tv_loss       = step_tv       / n,
+            gram_loss     = gram_once,
+            tv_loss       = tv_once,
             dino_loss     = step_dino_l   / n,
             preserve_loss = step_preserve / n,
-            content_loss  = (step_content / n) if config.lambda_content > 0 else None,
+            content_loss  = content_once,
             lambda_c      = config.lambda_c,
             lambda_tv     = config.lambda_tv,
             lambda_dino   = config.lambda_dino,
@@ -707,9 +741,9 @@ def train_patch(
                 f"step {step+1:4d}/{config.num_steps} | "
                 f"loss={loss.item():.4f} | "
                 f"attack={step_attack.item()/n:.4f} | "
-                f"gram={step_gram.item()/n:.4f} | "
+                f"gram={gram_once.item():.4f} | "
                 f"dino={step_dino_l.item()/n:.4f} | "
-                f"content={step_content.item()/n:.4f} | "
+                f"content={(content_once.item() if content_once is not None else 0.0):.4f} | "
                 f"preserve={step_preserve.item()/n:.4f}"
             )
 
@@ -790,6 +824,7 @@ def _filter_by_clean_prediction(
 
     kept = []
     n_err = 0
+    first_exc = None
     for inst in instances:
         frame  = _load_frame(inst).to(device)
         spec   = inst['gpt_spec']
@@ -850,13 +885,23 @@ def _filter_by_clean_prediction(
 
         except Exception as e:
             n_err += 1
+            if first_exc is None:
+                import traceback
+                first_exc = (e, traceback.format_exc())
             if n_err <= 3:
                 print(f"  [filter] instance dropped by error: {type(e).__name__}: {e}")
             continue
 
     if n_err:
-        print(f"  [filter] {n_err} instance(s) dropped due to errors (first 3 shown). "
-              f"If ALL instances were dropped this is likely a code bug, not VINE.")
+        print(f"  [filter] {n_err} instance(s) dropped due to errors (first 3 shown).")
+    # If EVERY instance errored, this is a code bug, not "VINE grounds nothing" --
+    # surface the real traceback instead of the misleading empty-instances message.
+    if not kept and first_exc is not None:
+        _e, _tb = first_exc
+        raise RuntimeError(
+            f"clean-prediction filter dropped ALL {n_err} instance(s) due to errors "
+            f"(likely a code bug, not VINE). First error:\n{_tb}"
+        ) from _e
     return kept
 
 

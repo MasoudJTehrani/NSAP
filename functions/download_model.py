@@ -37,6 +37,18 @@ REPOS = {
 
 HF_TOKEN = os.environ.get("HF_TOKEN")
 
+# --- Frozen sim dataset (SceneGraphBench snapshot) on the HuggingFace Hub ---
+HF_DATA_ID        = "MasoudJTehrani/NSAP-sim-data"
+# Pinned to the dataset commit sha for EXACT reproducibility (a mutable branch like
+# 'main' would drift if the repo is ever changed). Override with $NSAP_DATA_REVISION.
+HF_DATA_REVISION  = os.environ.get("NSAP_DATA_REVISION", "cfc526c9d27c9ba16f8df097da2490abe0acce2b")
+SIM_DATA_DIR      = ROOT / "dataset" / "sim"
+# The EB-Nav deployment scenes (kitchen_ebnav) live in the SAME dataset repo under a
+# kitchen_ebnav/ subfolder, fetched as a sibling of sim (used by the category
+# chameleons and the MIM). See download_dataset().
+EBNAV_DATA_DIR    = ROOT / "dataset" / "kitchen_ebnav"
+SIM_DATA_SENTINEL = DATASET_DIR / ".sim_data_downloaded"
+
 
 def _require_hf_hub():
     try:
@@ -145,6 +157,44 @@ def download_sam2() -> None:
         return
     _download_file(HF_SAM2_URL, SAM2_CHECKPOINT)
     SAM2_SENTINEL.touch()
+
+
+def download_dataset(revision: str | None = None) -> None:
+    """Download the frozen SceneGraphBench sim dataset snapshot from the HF Hub.
+
+    Pin `revision` (a commit sha, via $NSAP_DATA_REVISION) for exact reproducibility;
+    defaults to 'main'. Idempotent (sentinel-guarded). The dataset repo is public, so
+    no token is required.
+    """
+    hf = _require_hf_hub()
+    if SIM_DATA_SENTINEL.exists():
+        print("  Sim dataset already present, skipping.")
+        return
+    rev = revision or HF_DATA_REVISION
+    # The repo holds the merged sim dataset at its ROOT (manifest.json + scenarios/)
+    # plus a kitchen_ebnav/ subfolder for the EB-Nav deployment scenes. Lay them out
+    # as siblings locally: sim -> dataset/sim, kitchen_ebnav -> dataset/kitchen_ebnav.
+    SIM_DATA_DIR.mkdir(parents=True, exist_ok=True)
+    print(f"  Downloading dataset {HF_DATA_ID}@{rev} -> {SIM_DATA_DIR} ...")
+    hf.snapshot_download(
+        repo_id=HF_DATA_ID,
+        repo_type="dataset",
+        revision=rev,
+        local_dir=str(SIM_DATA_DIR),
+        token=HF_TOKEN,
+        ignore_patterns=["kitchen_ebnav/*"],
+    )
+    print(f"  Downloading kitchen_ebnav -> {EBNAV_DATA_DIR} ...")
+    hf.snapshot_download(
+        repo_id=HF_DATA_ID,
+        repo_type="dataset",
+        revision=rev,
+        local_dir=str(DATASET_DIR),
+        token=HF_TOKEN,
+        allow_patterns=["kitchen_ebnav/*"],
+    )
+    SIM_DATA_SENTINEL.touch()
+    print(f"  Saved to: {SIM_DATA_DIR}  and  {EBNAV_DATA_DIR}")
 
 
 def main(include_detection: bool = False) -> None:

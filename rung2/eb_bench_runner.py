@@ -52,14 +52,13 @@ def set_determinism(seed=42):
         print(f"  [determinism] use_deterministic_algorithms warn: {repr(e)[:100]}", flush=True)
     print(f"  [determinism] seeds={seed} cudnn.deterministic=True (VINE/GD)", flush=True)
 
-# per-EB-Nav-index SCENE-MATCHED patch: (category slug, kitchen_ebnav scenario id).
-# The scenario's own chameleon is used if it trained; else the category universal is the
-# fallback (some scenarios have no chameleon -- VINE never reads the object at those views).
-# Kettle (idx 11, 18) omitted: VINE can't classify it -> unattackable.
+# per-EB-Nav-index SCENE-MATCHED chameleon: (category slug, kitchen_ebnav scenario id).
+# Only the 5 indices whose chameleon actually trained are kept; the rest are unattackable and
+# omitted (kettle at idx 11/18, plus pot/toaster scenarios where VINE never reads the object,
+# so there is no clean instance to attack -- same root cause as the kettle drop).
 CHAM = {
-    1:  ("pot", "00000"),           2:  ("toaster", "00001"),        3:  ("pot", "00002"),
-    4:  ("pot", "00003"),           7:  ("toaster", "00004"),        9:  ("toaster", "00005"),
-    13: ("pot", "00007"),           15: ("pot", "00008"),            16: ("pot", "00009"),
+    2:  ("toaster", "00001"),        3:  ("pot", "00002"),
+    4:  ("pot", "00003"),            7:  ("toaster", "00004"),
     19: ("coffee_machine", "00011"),
 }
 
@@ -68,7 +67,8 @@ def _patch_for_index(idx):
     # CHAMELEON ONLY -- the universal (loud) patch is no longer used/evaluated. A scenario
     # with no chameleon (VINE can't read the object) is simply not attacked.
     slug, sid = CHAM[idx]
-    cham = f"output/chexp/cham_category_{slug}_scenario_{sid}/category_{slug}/category_{slug}_final.pt"
+    cham = (f"output/chameleon_patches/category_{slug}/ebnav_scenario_{sid}/"
+            f"category_{slug}/category_{slug}_final.pt")
     if os.path.isfile(os.path.join(NSAP, cham)):
         return cham, "chameleon"
     return None, "none"
@@ -95,6 +95,33 @@ def mim_frame(env, obs, patch, target_id):
     if bbox is None:                       # target not GT-visible this frame -> nothing to patch
         return frame, False
     return nsap_inject.paste_on_bbox(frame, bbox, patch)
+
+
+def _dump_step(planner, viz_dir, step, instr, img_path, action, reasoning, pf):
+    """Append a readable per-step trace to <ep>/trace.txt so you can see WHY the agent moved:
+    instruction -> what VINE was asked to ground -> GroundingDINO detections -> SGClip's grounded
+    objects/relations -> the SG TEXT fed to the MLLM -> the MLLM's plan -> the chosen action."""
+    L = ["=" * 84,
+         f"STEP {step}   frame={os.path.basename(img_path)}   (patched frames so far: {pf})",
+         f"INSTRUCTION: {instr}"]
+    c = getattr(planner, "_nsap_last_concepts", None)
+    if c:
+        L.append(f"[1] MLLM asked SGClip to ground -> objects={c.get('objects')}  "
+                 f"attributes={c.get('attributes')}  relations={c.get('relations')}")
+    L.append(f"[1b] detector query={getattr(planner, '_nsap_gd_query', '?')}  -> GroundingDINO "
+             f"found {getattr(planner, '_nsap_gd_nboxes', '?')} boxes: {getattr(planner, '_nsap_gd_labels', None)}")
+    L.append(f"[2] SGClip grounded objects:   {getattr(planner, '_nsap_last_labels', None)}")
+    L.append(f"[2b] SGClip top-k per box (prob,name) [aggr_thres={getattr(planner, 'aggr_thres', '?')}]: "
+             f"{getattr(planner, '_nsap_predicted_name', None)}")
+    L.append(f"[2b] classify vocab (query_names): {getattr(planner, '_nsap_query_names', None)}")
+    L.append(f"[2] SGClip grounded relations: {getattr(planner, '_nsap_last_relations', None)}")
+    L.append(f"[3] SG TEXT fed to the MLLM:\n    {getattr(planner, '_nsap_last_sg_text', '')}")
+    if isinstance(reasoning, dict) and reasoning:
+        for k, v in reasoning.items():
+            L.append(f"[4] MLLM {k}: {str(v)[:700]}")
+    L.append(f"[5] ACTION chosen: {action}")
+    with open(os.path.join(viz_dir, "trace.txt"), "a") as f:
+        f.write("\n".join(L) + "\n\n")
 
 
 def run_episode(env, planner, patch, viz_dir):
@@ -134,6 +161,7 @@ def run_episode(env, planner, patch, viz_dir):
             try: reasoning = json.loads(reasoning)
             except Exception: reasoning = {}
             save_grounded(step)
+            _dump_step(planner, viz_dir, step, instr, img_path, action, reasoning, pf)
             acts = action if isinstance(action, list) else [action]
             budget = max(1, env._max_episode_steps - env._current_step + 1)
             for i, a in enumerate(acts[:budget]):
@@ -190,7 +218,7 @@ SHORT = {"base_benign": "base", "esca_benign": "esca_b", "esca_patch": "esca_p"}
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--eval-sets", default="long_horizon,visual_appearance")
-    ap.add_argument("--indices", default="1,2,3,4,7,9,13,15,19")   # 9 attackable (chameleon) scenarios
+    ap.add_argument("--indices", default="2,3,4,7,19")   # the 5 indices with a trained EB-Nav chameleon
     ap.add_argument("--conditions", default="base_benign,esca_benign,esca_patch")
     ap.add_argument("--model", default="gpt-4o-mini")
     ap.add_argument("--reps", type=int, default=1, help="repeat every episode N times")

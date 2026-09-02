@@ -32,9 +32,12 @@ def pick_pose(c, tgt_pos, dmin=2.0, dmax=3.5, face_away=True):
 
 
 def chameleon_ids(task):
-    base = "output/chexp_attr_cham" if task == "attribute" else "output/chexp_rel_cham"
+    if task == "attribute":
+        base, pre = "output/chameleon_patches/attribute_Television_displaying", "tv_scenario_*"
+    else:
+        base, pre = "output/chameleon_patches/relation_on_Pot", "pot_scenario_*"
     out = []
-    for d in sorted(glob.glob(os.path.join(NSAP, base, "scenario_*"))):
+    for d in sorted(glob.glob(os.path.join(NSAP, base, pre))):
         if glob.glob(os.path.join(d, "*", "*final*.pt")):
             out.append(os.path.basename(d).split("_")[-1])
     return out

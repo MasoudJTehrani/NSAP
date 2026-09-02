@@ -12,8 +12,20 @@ import torch
 import torch.optim as optim
 import numpy as np
 from typing import List, Tuple, NamedTuple
-import copy
 from functions.attack.data import load_frame as _load_frame
+
+
+def _target_index(kws: List[str], target: str):
+    """Index of `target` in `kws`: exact match first, else the positive (non-'not ')
+    substring match, so the 2-way contrast negation is never picked."""
+    t = target.lower()
+    for i, c in enumerate(kws):
+        if c.lower() == t:
+            return i
+    for i, c in enumerate(kws):
+        if t in c.lower() and not c.lower().startswith("not "):
+            return i
+    return None
 
 
 class Anchor(NamedTuple):
@@ -148,6 +160,7 @@ def _evaluate_anchor(
     from functions.attack.preprocess import (
         clip_scores,
         extract_single_object_torch,
+        crop_image_contain_bboxes_torch,
     )
     from functions.attack.losses import l_attack_cw
 
@@ -155,24 +168,26 @@ def _evaluate_anchor(
     if len(eval_instances) == 0:
         return float('inf')
 
-    # For anchor evaluation we need instances with ≥2 keywords so the CW loss
-    # has something to distinguish.  The first N instances might all come from
-    # a single clip with a 1-word vocabulary, so search the full list.
-    target_str = target_attribute if attack_mode == 'attribute' else target_category
-    kw_key     = 'unary_kws' if attack_mode == 'attribute' else 'consts'
+    # Score anchors through the SAME objective the attack optimises:
+    #   category  -> multi-way over the clip's category vocab ('consts'),
+    #   attribute -> the 2-way contrast [attr, "not attr"] (matches train.py/deploy).
+    is_attr    = (attack_mode == 'attribute')
+    target_str = target_attribute if is_attr else target_category
     cw_eval_instances = []
     for inst in eval_instances + list(instances):   # eval_subset first, then full list
-        spec = inst['gpt_spec']
-        kws  = spec.get(kw_key, [])
-        cidx = next((i for i, c in enumerate(kws) if target_str.lower() in c.lower()), None)
-        if cidx is not None and len(kws) >= 2:
-            cw_eval_instances.append((inst, kws, cidx))
+        if is_attr:
+            kws, cidx = [target_attribute, f"not {target_attribute}"], 0
+        else:
+            kws  = inst['gpt_spec'].get('consts', [])
+            cidx = _target_index(kws, target_str)
+            if cidx is None or len(kws) < 2:   # need >=2 classes for a CW margin
+                continue
+        cw_eval_instances.append((inst, kws, cidx))
         if len(cw_eval_instances) >= 20:
             break
 
     if not cw_eval_instances:
-        # No multi-class instances found — anchor evaluation cannot use CW loss;
-        # skip warmup and return 0 (all anchors are equivalent).
+        # Nothing scorable (e.g. category vocab always size 1) -- all anchors tie.
         return 0.0
 
     def batch_loss(patch):
@@ -186,8 +201,12 @@ def _evaluate_anchor(
             # inside the bbox), so the anchor is selected under the real placement.
             cx, cy = anchor_center(Anchor(anchor_dx, anchor_dy, ''), bbox, ph, pw)
             patched = paste_patch(frame, patch.pixels_hwc, cx, cy, ph, pw)
-            # category/attribute: eval classifies on the FULL frame (no bbox crop)
-            proc   = extract_single_object_torch(patched, mask, alpha=vine_model.config.alpha)
+            if is_attr:
+                # attribute head deployment forward: a raw bbox crop (matches train.py)
+                proc = crop_image_contain_bboxes_torch(patched, [bbox])
+            else:
+                # category head: the FULL frame, background whitened (no bbox crop)
+                proc = extract_single_object_torch(patched, mask, alpha=vine_model.config.alpha)
             scores = clip_scores(vine_model, clip_encoder, proc, inst_kws, device, clip_image_size)
             total  = total + l_attack_cw(scores, inst_correct_idx)
         return total / len(cw_eval_instances)
@@ -222,18 +241,17 @@ def select_anchor(
     if len(eval_subset) == 0:
         raise ValueError("No instances available for anchor selection.")
 
-    # Gather relative-offset candidates (convert SAM absolute → relative per instance)
-    candidate_votes: dict = {}   # (dx, dy) -> cumulative vote count
-
+    # Gather unique relative-offset candidates (SAM absolute centroid -> offset
+    # from each instance's bbox center).
+    candidates, seen = [], set()
     for inst in eval_subset[:20]:
         frame_np = _load_frame(inst).numpy().astype(np.uint8)
         bbox     = inst['bbox']
-        abs_anchors = _get_sam_anchors(frame_np, bbox, sam_predictor)
-        for cx, cy in abs_anchors:
-            dx, dy = _abs_to_rel(cx, cy, bbox)
-            candidate_votes[(dx, dy)] = candidate_votes.get((dx, dy), 0) + 1
-
-    candidates = list(candidate_votes.keys())
+        for cx, cy in _get_sam_anchors(frame_np, bbox, sam_predictor):
+            dxy = _abs_to_rel(cx, cy, bbox)
+            if dxy not in seen:
+                seen.add(dxy)
+                candidates.append(dxy)
     if not candidates:
         candidates = [(0, 0)]   # fallback: bbox center
 
@@ -294,16 +312,15 @@ def select_relation_anchor(
     if len(eval_subset) == 0:
         raise ValueError("No relation instances available for anchor selection.")
 
-    candidate_votes: dict = {}
+    candidates, seen = [], set()
     for inst in eval_subset[:20]:
         frame_np  = _load_frame(inst).numpy().astype(np.uint8)
         subj_bbox = inst['subj_bbox']
-        abs_anchors = _get_sam_anchors(frame_np, subj_bbox, sam_predictor)
-        for cx, cy in abs_anchors:
-            dx, dy = _abs_to_rel(cx, cy, subj_bbox)
-            candidate_votes[(dx, dy)] = candidate_votes.get((dx, dy), 0) + 1
-
-    candidates = list(candidate_votes.keys())
+        for cx, cy in _get_sam_anchors(frame_np, subj_bbox, sam_predictor):
+            dxy = _abs_to_rel(cx, cy, subj_bbox)
+            if dxy not in seen:
+                seen.add(dxy)
+                candidates.append(dxy)
     if not candidates:
         candidates = [(0, 0)]
 
@@ -315,11 +332,10 @@ def select_relation_anchor(
     )
     from functions.attack.losses import l_attack_cw
 
-    binary_kws  = eval_subset[0]['gpt_spec'].get('binary_kws', [])
-    correct_idx = next(
-        (i for i, k in enumerate(binary_kws) if target_relation.lower() in k.lower()),
-        0,
-    )
+    # Score anchors through the SAME 2-way contrast the relation attack optimises
+    # ([rel, "not rel"]), not one instance's multi-way binary vocab.
+    binary_kws  = [target_relation, f"not {target_relation}"]
+    correct_idx = 0
 
     best_loss  = float('inf')
     best_dx, best_dy = candidates[0]

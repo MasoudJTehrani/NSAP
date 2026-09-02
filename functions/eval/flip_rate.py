@@ -46,6 +46,13 @@ def compute_flip_rate_across_clips(
 
     all_results = []
 
+    # Eval parity: ground the attacked attribute/relation via the 2-way [k, "not k"]
+    # contrast (same forward as train.py + ESCA), not the multi-way vocab.
+    _uk = ([config.target_attribute, f"not {config.target_attribute}"]
+           if config.attack_mode == 'attribute' and getattr(config, 'target_attribute', '') else None)
+    _bk = ([config.target_relation, f"not {config.target_relation}"]
+           if config.attack_mode == 'relation' and getattr(config, 'target_relation', '') else None)
+
     for item in clip_items:
         if item is None:
             continue
@@ -55,7 +62,8 @@ def compute_flip_rate_across_clips(
         bboxes       = item['bboxes']
         gpt_spec     = item['gpt_spec']
 
-        sg_clean = predict_scene_graph(vine_model, clean_frames, masks, bboxes, gpt_spec, device)
+        sg_clean = predict_scene_graph(vine_model, clean_frames, masks, bboxes, gpt_spec, device,
+                                       unary_kws_override=_uk, binary_kws_override=_bk)
         flips: List[bool] = []
 
         if config.attack_mode in ('category', 'attribute'):
@@ -72,9 +80,11 @@ def compute_flip_rate_across_clips(
                                   if _cat_ok(_gt.get(oid, ''), config.target_category)}
 
             if config.attack_mode == 'attribute' and getattr(config, 'target_attribute', ''):
+                # exact-positive: 2-way grounding yields exactly "k" or "not k";
+                # a substring test would also match "not k".
                 target_obj_ids = {
                     oid for oid in target_obj_ids
-                    if config.target_attribute.lower() in (sg_clean.attributes.get(oid) or '').lower()
+                    if (sg_clean.attributes.get(oid) or '').lower() == config.target_attribute.lower()
                 }
 
             # Confidence gate: drop objects VINE only weakly calls the target
@@ -106,6 +116,7 @@ def compute_flip_rate_across_clips(
                 )
                 sg_patched = predict_scene_graph(
                     vine_model, patched_frames, masks, bboxes, gpt_spec, device,
+                    unary_kws_override=_uk, binary_kws_override=_bk,
                 )
 
                 patched_preds = (sg_patched.categories if config.attack_mode == 'category'
@@ -116,7 +127,7 @@ def compute_flip_rate_across_clips(
         elif config.attack_mode == 'relation':
             target_pairs = {
                 pair for pair, rel in sg_clean.relations.items()
-                if config.target_relation.lower() in rel.lower()
+                if rel.lower() == config.target_relation.lower()   # exact-positive (2-way)
             } if config.target_relation else set(sg_clean.relations.keys())
 
             if config.target_category:
@@ -147,6 +158,7 @@ def compute_flip_rate_across_clips(
                 )
                 sg_patched = predict_scene_graph(
                     vine_model, patched_frames, masks, bboxes, gpt_spec, device,
+                    unary_kws_override=_uk, binary_kws_override=_bk,
                 )
                 p_pred = sg_patched.relations.get(pair)
                 flips.append(c_pred != p_pred if p_pred is not None else True)

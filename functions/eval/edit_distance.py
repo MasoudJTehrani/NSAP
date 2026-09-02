@@ -1,5 +1,5 @@
 """
-Scene graph edit distance — proves attack isolation.
+Scene graph edit distance: proves attack isolation.
 
 All metrics are computed on the TARGET object(s) only:
   - category/attribute attack: objects whose clean-SG category matches target_category
@@ -11,8 +11,9 @@ frame where it appears; then the full multi-frame scene graph is re-predicted
 and compared against the clean graph.  This mirrors the real-world scenario
 where a single person wears the physical patch.
 
-Per-object rates are normalised by n_target_objects so they are comparable
-across clips regardless of how many objects the clip contains.
+Results are POOLED across frames as raw counts, not per-clip means: with a
+generated dataset every sample is one frame, so per-clip means only dilute the
+signal. Isolation = fraction of all target-object changes that hit the attacked head.
 """
 
 from typing import Dict, Tuple
@@ -25,63 +26,15 @@ from functions.eval._common import _cat_ok, _patch_object_across_frames
 
 @dataclass
 class EditDistanceResult:
-    n_target_objects: int = 0
-    n_target_relations: int = 0
+    """Per-frame change counts on the target object(s). A plain data holder;
+    all aggregation (pooled counts, isolation) is done in evaluate_isolation."""
+    n_target_objects: int = 0     # distinct target objects patched (relation: subjects)
+    n_target_relations: int = 0   # target relation edges (relation mode only)
 
     category_changes: int = 0
     attribute_changes: int = 0
     relation_changes: int = 0
     target_disappeared: int = 0
-
-    @property
-    def _obj_denom(self) -> int:
-        return max(self.n_target_objects, 1)
-
-    @property
-    def _rel_denom(self) -> int:
-        return max(self.n_target_relations, 1)
-
-    @property
-    def category_change_rate(self) -> float:
-        return self.category_changes / self._obj_denom
-
-    @property
-    def attribute_change_rate(self) -> float:
-        return self.attribute_changes / self._obj_denom
-
-    @property
-    def relation_change_rate(self) -> float:
-        return self.relation_changes / self._rel_denom
-
-    @property
-    def disappear_rate(self) -> float:
-        return self.target_disappeared / self._obj_denom
-
-    @property
-    def total_changes(self) -> int:
-        return (
-            self.category_changes
-            + self.attribute_changes
-            + self.relation_changes
-            + self.target_disappeared
-        )
-
-    def isolation_score(self, attack_mode: str):
-        """
-        Fraction of changes on target objects that hit the attacked head.
-        1.0 = perfectly isolated; 0.0 = all changes were collateral.
-        Returns None when there are NO changes — isolation is undefined then
-        (an attack that changed nothing is NOT "perfectly isolated").
-        """
-        if self.total_changes == 0:
-            return None
-        if attack_mode == 'category':
-            return (self.category_changes + self.target_disappeared) / self.total_changes
-        if attack_mode == 'attribute':
-            return self.attribute_changes / self.total_changes
-        if attack_mode == 'relation':
-            return self.relation_changes / self.total_changes
-        return 0.0
 
 
 # ── main evaluation entry point ───────────────────────────────────────────────
@@ -102,18 +55,23 @@ def evaluate_isolation(
     three heads (category, attribute, relation) are measured for that object,
     giving a true picture of attack focus vs collateral damage.
 
-    Returns dict with per-rate metrics (normalised by n_target_objects):
-        mean_n_target_objects     float
-        mean_category_change_rate float
-        mean_attribute_change_rate float
-        mean_relation_change_rate  float
-        mean_disappear_rate        float
-        mean_isolation_score       float
-        per_clip                   list[EditDistanceResult]
+    Returns dict of POOLED raw counts:
+        total_target_objects / total_target_relations   int
+        total_{category,attribute,relation}_changes      int
+        total_disappeared / total_changes                int
+        pooled_isolation_score                           float | None
+        per_clip                                         list[EditDistanceResult]
     """
     from functions.eval.scene_graph import predict_scene_graph
 
     all_edits = []
+
+    # Eval parity: ground the attacked attribute/relation via the 2-way [k, "not k"]
+    # contrast (same forward as train.py + ESCA), not the multi-way vocab.
+    _uk = ([config.target_attribute, f"not {config.target_attribute}"]
+           if config.attack_mode == 'attribute' and getattr(config, 'target_attribute', '') else None)
+    _bk = ([config.target_relation, f"not {config.target_relation}"]
+           if config.attack_mode == 'relation' and getattr(config, 'target_relation', '') else None)
 
     for item in clip_items:
         if item is None:
@@ -124,7 +82,8 @@ def evaluate_isolation(
         bboxes       = item['bboxes']
         gpt_spec     = item['gpt_spec']
 
-        sg_clean = predict_scene_graph(vine_model, clean_frames, masks, bboxes, gpt_spec, device)
+        sg_clean = predict_scene_graph(vine_model, clean_frames, masks, bboxes, gpt_spec, device,
+                                       unary_kws_override=_uk, binary_kws_override=_bk)
         clip_result = EditDistanceResult()
 
         if config.attack_mode in ('category', 'attribute'):
@@ -140,9 +99,10 @@ def evaluate_isolation(
                                   if _cat_ok(_gt.get(oid, ''), config.target_category)}
 
             if config.attack_mode == 'attribute' and getattr(config, 'target_attribute', ''):
+                # exact-positive (2-way grounding yields exactly "k" or "not k").
                 target_obj_ids = {
                     oid for oid in target_obj_ids
-                    if config.target_attribute.lower() in (sg_clean.attributes.get(oid) or '').lower()
+                    if (sg_clean.attributes.get(oid) or '').lower() == config.target_attribute.lower()
                 }
 
             _min_conf = getattr(config, 'min_target_conf', 0.0)
@@ -167,6 +127,7 @@ def evaluate_isolation(
                 )
                 sg_patched = predict_scene_graph(
                     vine_model, patched_frames, masks, bboxes, gpt_spec, device,
+                    unary_kws_override=_uk, binary_kws_override=_bk,
                 )
 
                 if obj_id not in sg_patched.categories:
@@ -186,7 +147,7 @@ def evaluate_isolation(
         elif config.attack_mode == 'relation':
             target_pairs = {
                 pair for pair, rel in sg_clean.relations.items()
-                if config.target_relation.lower() in rel.lower()
+                if rel.lower() == config.target_relation.lower()   # exact-positive (2-way)
             } if config.target_relation else set(sg_clean.relations.keys())
 
             if config.target_category:
@@ -217,6 +178,7 @@ def evaluate_isolation(
                 )
                 sg_patched = predict_scene_graph(
                     vine_model, patched_frames, masks, bboxes, gpt_spec, device,
+                    unary_kws_override=_uk, binary_kws_override=_bk,
                 )
 
                 if subj_id not in sg_patched.categories:
@@ -267,24 +229,11 @@ def evaluate_isolation(
         attacked_total = 0
     # Pooled isolation: of ALL changes on target objects, the fraction that hit
     # the attacked head. None when there were NO changes at all (0 target objects,
-    # or the attack flipped nothing) — isolation is undefined then, NOT 100%.
+    # or the attack flipped nothing), isolation is undefined then, NOT 100%.
     pooled_isolation = (attacked_total / tot_changes) if tot_changes else None
 
-    # Per-clip mean isolation: average ONLY over clips that actually had changes.
-    # A no-change clip has undefined isolation; the old code counted it as 100%,
-    # which inflated the mean. None when no clip changed anything.
-    _iso = [s for s in (e.isolation_score(config.attack_mode) for e in all_edits)
-            if s is not None]
-    mean_isolation = (sum(_iso) / len(_iso)) if _iso else None
-
     return {
-        'mean_n_target_objects':      sum(e.n_target_objects       for e in all_edits) / n,
-        'mean_category_change_rate':  sum(e.category_change_rate   for e in all_edits) / n,
-        'mean_attribute_change_rate': sum(e.attribute_change_rate  for e in all_edits) / n,
-        'mean_relation_change_rate':  sum(e.relation_change_rate   for e in all_edits) / n,
-        'mean_disappear_rate':        sum(e.disappear_rate         for e in all_edits) / n,
-        'mean_isolation_score':       mean_isolation,
-        # raw counts (pooled)
+        # raw counts (pooled across frames)
         'n_clips':                  n,
         'n_clips_with_targets':     sum(1 for e in all_edits if e.n_target_objects > 0),
         'total_target_objects':     tot_obj,

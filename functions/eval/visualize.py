@@ -138,6 +138,12 @@ def save_sample_images(
     target_relation = getattr(config, 'target_relation', '')
     target_attribute = getattr(config, 'target_attribute', '')
 
+    # Eval parity: ground the attacked attribute/relation via the 2-way [k, "not k"]
+    # contrast (same forward as train.py + ESCA), not the multi-way vocab -- else the
+    # attribute (whose word is not in ATTRIBUTE_WORDS) selects 0 targets and saves nothing.
+    _uk = ([target_attribute, f"not {target_attribute}"] if mode == 'attribute' and target_attribute else None)
+    _bk = ([target_relation, f"not {target_relation}"] if mode == 'relation' and target_relation else None)
+
     worked_list: list = []
     failed_list:  list = []
 
@@ -154,7 +160,8 @@ def save_sample_images(
         data_id      = item['data_id']
 
         # Clip-level scene graph on clean frames (used for prediction labels)
-        sg_clean    = predict_scene_graph(vine_model, clean_frames, masks, bboxes, gpt_spec, device)
+        sg_clean    = predict_scene_graph(vine_model, clean_frames, masks, bboxes, gpt_spec, device,
+                                          unary_kws_override=_uk, binary_kws_override=_bk)
 
         # ── Collect per-object entries ────────────────────────────────────────
         entries = []
@@ -173,9 +180,10 @@ def save_sample_images(
                                   if _cat_ok(_gt.get(oid, ''), target_category)}
             # For attribute mode also require the clean attribute to match target_attribute
             if mode == 'attribute' and target_attribute:
+                # exact-positive (2-way grounding yields exactly "k" or "not k").
                 target_obj_ids = {
                     oid for oid in target_obj_ids
-                    if target_attribute.lower() in (sg_clean.attributes.get(oid) or '').lower()
+                    if (sg_clean.attributes.get(oid) or '').lower() == target_attribute.lower()
                 }
 
             # Confidence gate (matches training/eval): drop weak-category objects.
@@ -217,6 +225,7 @@ def save_sample_images(
                 sg_patched_single = predict_scene_graph(
                     vine_model, [patched_frame], {0: masks.get(frame_id, {})},
                     {0: bboxes.get(frame_id, {})}, gpt_spec, device,
+                    unary_kws_override=_uk, binary_kws_override=_bk,
                 )
                 patched_preds = (
                     sg_patched_single.categories if mode == 'category'
@@ -242,7 +251,7 @@ def save_sample_images(
             attacked_head = 'relation'
             target_pairs = {
                 pair for pair, rel in sg_clean.relations.items()
-                if target_relation.lower() in rel.lower()
+                if rel.lower() == target_relation.lower()   # exact-positive (2-way)
             }
             if target_category:
                 target_pairs = {
@@ -283,6 +292,7 @@ def save_sample_images(
                 sg_patched_single = predict_scene_graph(
                     vine_model, [patched_frame], {0: masks.get(frame_id, {})},
                     {0: bboxes.get(frame_id, {})}, gpt_spec, device,
+                    unary_kws_override=_uk, binary_kws_override=_bk,
                 )
                 patched_p = sg_patched_single.relations.get(pair)
                 did_flip  = (clean_p != patched_p) if patched_p is not None else True

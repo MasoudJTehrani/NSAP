@@ -23,6 +23,10 @@ import numpy as np
 import torch
 
 # Candidate vocabularies VINE classifies against (the gpt_spec keyword lists).
+# NOTE: the ATTACKED attribute/relation word need NOT appear here. The attribute
+# and relation attacks use a 2-way contrast [k, "not k"] built from the target
+# word (e.g. "displaying"), not a multi-way argmax over these lists. These lists
+# are only the multi-way candidate set for eval/isolation of the NON-attacked heads.
 ATTRIBUTE_WORDS = ['open', 'closed', 'on', 'off', 'sliced', 'cooked',
                    'clean', 'dirty', 'filled', 'broken']
 RELATION_WORDS = ['on', 'in', 'near']
@@ -72,10 +76,20 @@ class SimAttackDataset:
     TRAIN_RATIO = 0.8
 
     def __init__(self, sim_data_dir, target_category=None, target_attribute=None,
-                 target_relation=None, split=None, max_clips=0, only_scenarios=None):
+                 target_relation=None, split=None, max_clips=0, only_scenarios=None,
+                 data_source=None):
         self.root = sim_data_dir
-        manifest = json.load(open(os.path.join(sim_data_dir, 'manifest.json')))
+        manifest_path = os.path.join(sim_data_dir, 'manifest.json')
+        if not os.path.isfile(manifest_path):
+            raise FileNotFoundError(
+                f"No SceneGraphBench dataset at '{sim_data_dir}' (missing manifest.json). "
+                f"Get it with `python NSAP.py --with-dataset` (downloads to dataset/sim/) "
+                f"or generate one from the SceneGraphBench/ submodule, then pass --sim-data."
+            )
+        manifest = json.load(open(manifest_path))
         entries = manifest['scenarios']
+        if data_source:   # restrict to one merge source (unified manifest 'source' tag)
+            entries = [e for e in entries if e.get('source') == data_source]
 
         if only_scenarios is not None:
             # Restrict to an explicit set of scenario ids (used by the per-scenario
@@ -167,6 +181,9 @@ class SimAttackDataset:
                 objs = [o for o in fr['objects']
                         if not target_category or o['category'].lower() == target_category.lower()]
                 if target_predicate:
+                    # substring so a target matches its GT form ('open' in 'opened',
+                    # 'on' in 'turned on'); GT attributes are clean words, so this
+                    # does not over-match in practice.
                     objs = [o for o in objs
                             if any(target_predicate.lower() in a.lower() for a in o.get('attributes', []))]
                 if not objs:

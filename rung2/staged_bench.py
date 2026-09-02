@@ -223,9 +223,11 @@ def cham_for(ep):
         return ep["patch"] if os.path.isfile(os.path.join(NSAP, ep["patch"])) else None
     sid = ep["scenario_id"]
     if ep["task"] == "attribute":
-        p = f"output/chexp_attr_cham/scenario_{sid}/attribute_television_displaying/attribute_television_displaying_final.pt"
+        p = (f"output/chameleon_patches/attribute_Television_displaying/tv_scenario_{sid}/"
+             f"attribute_Television_displaying/attribute_Television_displaying_final.pt")
     else:
-        p = f"output/chexp_rel_cham/scenario_{sid}/relation_on_pot/relation_on_pot_final.pt"
+        p = (f"output/chameleon_patches/relation_on_Pot/pot_scenario_{sid}/"
+             f"relation_on_Pot/relation_on_Pot_final.pt")
     return p if os.path.isfile(os.path.join(NSAP, p)) else None
 
 

@@ -1,6 +1,8 @@
+import numpy as np
 import torch
 import torch.nn as nn
-from typing import Tuple, Optional
+import torch.nn.functional as F
+from typing import Tuple
 
 
 class AdversarialPatch(nn.Module):
@@ -73,7 +75,6 @@ def paste_patch(
 
     # Resize patch_hwc to (patch_h, patch_w) if dimensions differ
     if patch_hwc.shape[0] != patch_h or patch_hwc.shape[1] != patch_w:
-        import torch.nn.functional as F
         p = patch_hwc.permute(2, 0, 1).unsqueeze(0)   # [1,3,ph,pw]
         p = F.interpolate(p, size=(patch_h, patch_w), mode='bilinear', align_corners=False)
         patch_hwc = p.squeeze(0).permute(1, 2, 0)     # [patch_h, patch_w, 3]
@@ -101,11 +102,10 @@ def paste_patch(
 
     patch_crop = patch_hwc[py1: py1 + rh, px1: px1 + rw]  # [rh, rw, 3]
 
-    # Differentiable paste using F.pad + spatial mask — no in-place ops so
+    # Differentiable paste using F.pad + spatial mask (no in-place ops) so
     # gradients flow cleanly from patch_crop back through patch.w.
-    import torch.nn.functional as F_
     patch_chw = patch_crop.permute(2, 0, 1).unsqueeze(0)         # [1,3,rh,rw]
-    patch_full = F_.pad(patch_chw, (x1, W - x2, y1, H - y2))    # [1,3,H,W]
+    patch_full = F.pad(patch_chw, (x1, W - x2, y1, H - y2))    # [1,3,H,W]
     patch_full = patch_full.squeeze(0).permute(1, 2, 0)          # [H,W,3]
 
     rows = torch.arange(H, device=frame.device)
@@ -133,3 +133,29 @@ def compute_patch_size(bbox: dict, coverage_ratio: float) -> Tuple[int, int]:
     patch_w = max(1, int(coverage_ratio * bw))
     patch_h = max(1, int(coverage_ratio * bh))
     return patch_h, patch_w
+
+
+def inject_patch(frame_uint8, bbox, w, anchor, cov):
+    """Decode a trained patch tensor and paste it onto `bbox` in a full-frame RGB uint8
+    image, using the exact training/eval placement math. Single source of truth for the
+    MIM injectors (rung2/harness.render_inject and rung2/nsap_inject.paste_on_bbox).
+
+    Args:
+        frame_uint8: [H, W, 3] uint8 RGB frame (not modified in place).
+        bbox:        {x1, y1, x2, y2} pixel dict, or None -> pass through.
+        w:           trained patch weight [3, ph, pw] (from load_patch), or None -> pass through.
+        anchor:      the patch Anchor (from load_patch).
+        cov:         coverage_ratio (from load_patch).
+
+    Returns:
+        (patched_uint8, injected_bool).
+    """
+    from functions.attack.anchor import anchor_center   # lazy: keep patch.py import-cycle-free
+    if w is None or bbox is None:
+        return frame_uint8, False
+    ph, pw = compute_patch_size(bbox, cov)
+    patch_hwc = (127.5 * (torch.tanh(w) + 1.0)).permute(1, 2, 0)
+    cx, cy = anchor_center(anchor, bbox, ph, pw)
+    ft = torch.from_numpy(frame_uint8.astype(np.float32))
+    out = paste_patch(ft, patch_hwc, cx, cy, ph, pw).clamp(0, 255).numpy().astype(np.uint8)
+    return out, True
