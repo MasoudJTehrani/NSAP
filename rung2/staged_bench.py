@@ -286,6 +286,8 @@ def main():
     allep, max_steps = load_episodes(args.episodes)
     tasks = args.tasks.split(",")
     episodes = [e for e in allep if e["task"] in tasks]
+    episodes = [e for e in episodes if cham_for(e)]   # only tasks with a trained chameleon (skip un-attackable scenes)
+    print(f"  {len(episodes)} attackable episodes (have a chameleon)", flush=True)
     conds = args.conditions.split(",")
     reps = max(1, args.reps)
     patches = {e["ep_id"]: (nsap_inject.load_patch(os.path.join(NSAP, cham_for(e))) if cham_for(e) else None)
