@@ -1,0 +1,33 @@
+# Stage 2 per-scenario chameleon patches. Generated from the saved patch configs.
+# Every row also uses: --object-init --no-chameleon --lambda-tv 0 --batch 1 --lr 0.01 --seed 0
+head	scenario	mode	target	attribute	relation	sim_data	coverage	lambda_content	steps	eot_crops	init_patch
+attribute_Television_displaying	tv_scenario_00000	attribute	Television	displaying	next to	dataset/sim	0.5	20.0	600	4	output/universal_patches/attribute_Television_displaying/attribute_Television_displaying_final.pt
+attribute_Television_displaying	tv_scenario_00001	attribute	Television	displaying	next to	dataset/sim	0.5	20.0	600	4	output/universal_patches/attribute_Television_displaying/attribute_Television_displaying_final.pt
+attribute_Television_displaying	tv_scenario_00002	attribute	Television	displaying	next to	dataset/sim	0.5	20.0	600	4	output/universal_patches/attribute_Television_displaying/attribute_Television_displaying_final.pt
+attribute_Television_displaying	tv_scenario_00003	attribute	Television	displaying	next to	dataset/sim	0.5	20.0	600	4	output/universal_patches/attribute_Television_displaying/attribute_Television_displaying_final.pt
+attribute_Television_displaying	tv_scenario_00004	attribute	Television	displaying	next to	dataset/sim	0.5	20.0	600	4	output/universal_patches/attribute_Television_displaying/attribute_Television_displaying_final.pt
+attribute_Television_displaying	tv_scenario_00005	attribute	Television	displaying	next to	dataset/sim	0.5	20.0	600	4	output/universal_patches/attribute_Television_displaying/attribute_Television_displaying_final.pt
+attribute_Television_displaying	tv_scenario_00006	attribute	Television	displaying	next to	dataset/sim	0.5	20.0	600	4	output/universal_patches/attribute_Television_displaying/attribute_Television_displaying_final.pt
+attribute_Television_displaying	tv_scenario_00007	attribute	Television	displaying	next to	dataset/sim	0.5	20.0	600	4	output/universal_patches/attribute_Television_displaying/attribute_Television_displaying_final.pt
+attribute_Television_displaying	tv_scenario_00008	attribute	Television	displaying	next to	dataset/sim	0.5	20.0	600	4	output/universal_patches/attribute_Television_displaying/attribute_Television_displaying_final.pt
+attribute_Television_displaying	tv_scenario_00009	attribute	Television	displaying	next to	dataset/sim	0.5	20.0	600	4	output/universal_patches/attribute_Television_displaying/attribute_Television_displaying_final.pt
+category_coffee_machine	ebnav_scenario_00011	category	coffee machine	-	next to	SceneGraphBench/data/kitchen_ebnav	0.5	5.0	600	4	output/universal_patches/category_coffee_machine/category_coffee_machine_final.pt
+category_coffee_machine	pilot_scenario_00002	category	coffee machine	-	next to	dataset/sim	0.3	20.0	600	4	output/universal_patches/category_coffee_machine/category_coffee_machine_final.pt
+category_coffee_machine	pilot_scenario_00013	category	coffee machine	-	next to	dataset/sim	0.3	20.0	600	4	output/universal_patches/category_coffee_machine/category_coffee_machine_final.pt
+category_coffee_machine	pilot_scenario_00015	category	coffee machine	-	next to	dataset/sim	0.3	20.0	600	4	output/universal_patches/category_coffee_machine/category_coffee_machine_final.pt
+category_pot	ebnav_scenario_00002	category	pot	-	next to	SceneGraphBench/data/kitchen_ebnav	0.5	20.0	600	4	output/universal_patches/category_pot/category_pot_final.pt
+category_pot	ebnav_scenario_00003	category	pot	-	next to	SceneGraphBench/data/kitchen_ebnav	0.5	20.0	600	4	output/universal_patches/category_pot/category_pot_final.pt
+category_toaster	ebnav_scenario_00001	category	toaster	-	next to	SceneGraphBench/data/kitchen_ebnav	0.5	5.0	600	4	output/universal_patches/category_toaster/category_toaster_final.pt
+category_toaster	ebnav_scenario_00004	category	toaster	-	next to	SceneGraphBench/data/kitchen_ebnav	0.5	5.0	600	4	output/universal_patches/category_toaster/category_toaster_final.pt
+category_toaster	pilot_scenario_00006	category	toaster	-	next to	dataset/sim	0.3	20.0	600	4	output/universal_patches/category_toaster/category_toaster_final.pt
+category_toaster	pilot_scenario_00008	category	toaster	-	next to	dataset/sim	0.3	20.0	600	4	output/universal_patches/category_toaster/category_toaster_final.pt
+category_toaster	pilot_scenario_00020	category	toaster	-	next to	dataset/sim	0.3	20.0	600	4	output/universal_patches/category_toaster/category_toaster_final.pt
+relation_on_Pot	pot_scenario_00001	relation	Pot	-	on	dataset/sim	0.5	20.0	600	4	output/universal_patches/relation_on_Pot/relation_on_Pot_final.pt
+relation_on_Pot	pot_scenario_00002	relation	Pot	-	on	dataset/sim	0.5	20.0	600	4	output/universal_patches/relation_on_Pot/relation_on_Pot_final.pt
+relation_on_Pot	pot_scenario_00003	relation	Pot	-	on	dataset/sim	0.5	20.0	600	4	output/universal_patches/relation_on_Pot/relation_on_Pot_final.pt
+relation_on_Pot	pot_scenario_00004	relation	Pot	-	on	dataset/sim	0.5	20.0	600	4	output/universal_patches/relation_on_Pot/relation_on_Pot_final.pt
+relation_on_Pot	pot_scenario_00005	relation	Pot	-	on	dataset/sim	0.5	20.0	600	4	output/universal_patches/relation_on_Pot/relation_on_Pot_final.pt
+relation_on_Pot	pot_scenario_00006	relation	Pot	-	on	dataset/sim	0.5	20.0	600	4	output/universal_patches/relation_on_Pot/relation_on_Pot_final.pt
+relation_on_Pot	pot_scenario_00007	relation	Pot	-	on	dataset/sim	0.5	20.0	600	4	output/universal_patches/relation_on_Pot/relation_on_Pot_final.pt
+relation_on_Pot	pot_scenario_00008	relation	Pot	-	on	dataset/sim	0.5	20.0	600	4	output/universal_patches/relation_on_Pot/relation_on_Pot_final.pt
+relation_on_Pot	pot_scenario_00009	relation	Pot	-	on	dataset/sim	0.5	20.0	600	4	output/universal_patches/relation_on_Pot/relation_on_Pot_final.pt

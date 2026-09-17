@@ -16,16 +16,22 @@ The ONLY interference is the MIM: the scene-matched chameleon is pasted on the i
 target's GT bbox before the planner grounds. Success is measured to BOTH the intended target
 and the distractor, so we see the attack redirect behaviour, not just lower success.
 """
-import os, sys, json, math, argparse, time
+import os, sys, json, math, argparse, time, gc
 os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 os.environ.setdefault("NSAP_LLM_SEED", "42")
 os.environ["NSAP_LASER_ATTR_REL"] = "1"   # attr+rel grounding ON for these attacks (category runner leaves it OFF)
+import torch
 import numpy as np
 from PIL import Image
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import harness   # noqa: F401
 from nav_harness import make_nav_planner   # noqa: E402
-import nsap_inject                          # noqa: E402
+import nsap_inject
+from step_log import StepLogger
+
+# Output root. Runs at different tau (or different variants) must not overwrite each
+# other: StepLogger truncates, so a re-run silently destroys the previous logs.
+OUT_ROOT = os.environ.get("NSAP_OUT_ROOT", "output/rung2/staged")                          # noqa: E402
 from embodiedbench.envs.eb_navigation.EBNavEnv import EBNavigationEnv   # noqa: E402
 
 NSAP = harness.NSAP
@@ -57,6 +63,58 @@ def stage_relation(c, scene, spawn_seed=3):
     return None, None, None
 
 
+def stage_relation_single(c, scene, spawn_seed=3, distractor_type="Fridge"):
+    """Single-pot relation staging.
+
+    WHY: the deployed scene graph never holds two nodes with the same label. Over 124
+    non-empty relation graphs at tau=0.4, not one contained two pots. A "this pot, not
+    that pot" task is therefore unresolvable from the graph in every condition, benign
+    included. Here we leave exactly ONE pot, resting on a counter top, and use a
+    distractor of a DIFFERENT type, so the branch is decidable from a single node.
+
+    Returns (pot, distractor, seed) or (None, None, None).
+    """
+    prefs = [distractor_type, "Fridge", "Microwave", "Sink", "GarbageCan", "Toaster"]
+    for seed in range(spawn_seed, spawn_seed + 8):
+        c.reset(scene=scene)
+        ev = c.step(action="InitialRandomSpawn", randomSeed=seed, forceVisible=True,
+                    numPlacementAttempts=12, numDuplicatesOfType=[{"objectType": "Pot", "count": 1}])
+        if not ev.metadata.get("lastActionSuccess"):
+            continue
+        pots = [o for o in c.last_event.metadata["objects"] if o["objectType"] == "Pot"]
+        onc = [o for o in pots if "CounterTop" in recep(o)]
+        if not onc:
+            continue
+        keep = onc[0]
+        # Remove every other pot so exactly one pot node can ever be grounded.
+        for o in pots:
+            if o["objectId"] == keep["objectId"]:
+                continue
+            for act in ("RemoveFromScene", "DisableObject"):
+                if c.step(action=act, objectId=o["objectId"]).metadata.get("lastActionSuccess"):
+                    break
+        pots = [o for o in c.last_event.metadata["objects"] if o["objectType"] == "Pot"]
+        if len(pots) != 1:
+            continue                       # could not clear the extras; try another seed
+        keep = pots[0]
+        # Distractor: a different object type, far enough away that "nearer than the
+        # distractor" is a meaningful test.
+        dist = None
+        for t in prefs:
+            cands = [o for o in c.last_event.metadata["objects"] if o["objectType"] == t]
+            cands = [o for o in cands
+                     if math.hypot(o["position"]["x"] - keep["position"]["x"],
+                                   o["position"]["z"] - keep["position"]["z"]) > 1.5]
+            if cands:
+                dist = min(cands, key=lambda o: math.hypot(o["position"]["x"] - keep["position"]["x"],
+                                                           o["position"]["z"] - keep["position"]["z"]))
+                break
+        if dist is None:
+            continue
+        return keep, dist, seed
+    return None, None, None
+
+
 def stage_attribute(c, scene, distractor_type):
     """Toggle the TV ON; return (tv, distractor_obj). Distractor = nearest object of distractor_type."""
     tvs = [o for o in c.last_event.metadata["objects"] if o["objectType"] == "Television"]
@@ -81,10 +139,14 @@ class StagedNavEnv(EBNavigationEnv):
 
     def reset(self, **kw):
         ep = self.dataset[self._current_episode_num]
+        self._current_episode_num += 1   # advance FIRST: a mid-reset THOR timeout must not re-run this episode
         self.episode_data = dict(ep)
         self.episode_language_instruction = ep["instruction"]
         self.env.reset(scene=ep["scene"])
-        if ep["task"] == "relation":
+        if ep["task"] == "relation" and int(ep.get("pots", 2)) == 1:
+            tgt, dist, _ = stage_relation_single(self.env, ep["scene"], ep.get("spawn_seed", 3),
+                                                 ep.get("distractor_type", "Fridge"))
+        elif ep["task"] == "relation":
             tgt, dist, _ = stage_relation(self.env, ep["scene"], ep.get("spawn_seed", 3))
         else:
             tgt, dist = stage_attribute(self.env, ep["scene"], ep.get("distractor_type", "Sofa"))
@@ -104,7 +166,6 @@ class StagedNavEnv(EBNavigationEnv):
         pose = ep["agentPose"]
         self.env.step(action="Teleport", position=pose["position"],
                       rotation={"x": 0, "y": pose["rotation"], "z": 0}, horizon=pose["horizon"], standing=True)
-        self._current_episode_num += 1
         self._current_step = 0
         self.standing = True
         self._reset = True
@@ -112,6 +173,14 @@ class StagedNavEnv(EBNavigationEnv):
         self._episode_start_time = time.time()
         self.img_paths = []
         return {"head_rgb": self.env.last_event.frame}
+
+    def _recreate_controller(self):
+        """A timed-out AI2-THOR backend is usually dead; stop it and start a fresh
+        controller with the same config so subsequent episodes are not lost too."""
+        import ai2thor.controller
+        try: self.env.stop()
+        except Exception: pass
+        self.env = ai2thor.controller.Controller(**self.config)
 
     def _dist(self, pos):
         if pos is None:
@@ -167,7 +236,16 @@ def _dump_step(planner, viz_dir, step, instr, img_path, action, reasoning, pf):
 
 
 def run_episode(env, planner, patch, viz_dir):
-    obs = env.reset()
+    try:
+        obs = env.reset()
+    except Exception as e:
+        # THOR backend hung mid-reset (e.g. a fresh controller stalling on its first teleport).
+        # The episode counter already advanced, so skip this one and rebuild the controller
+        # so the rest of the run stays healthy instead of crashing the whole multi-rep sweep.
+        print(f"      [reset error] {repr(e)[:140]} -> recreate THOR + skip", flush=True)
+        try: env._recreate_controller()
+        except Exception as e2: print(f"      [recreate failed] {repr(e2)[:140]}", flush=True)
+        return None
     if not env._staged_ok:
         print("      [skip] staging failed", flush=True)
         return None
@@ -176,12 +254,22 @@ def run_episode(env, planner, patch, viz_dir):
     planner.reset()
     os.makedirs(viz_dir, exist_ok=True)
     pf = 0; step = 0
+    last_patched = {}                       # step -> was that frame patched?
+    slog = StepLogger(viz_dir, meta={
+        "runner": "staged_bench", "episode": env.episode_data.get("ep_id"),
+        "task": env.episode_data.get("task"), "scene": env.episode_data.get("scene"),
+        "instruction": instr, "viz_dir": viz_dir,
+        "patch": None if patch is None else "chameleon",
+        "aggr_thres": os.environ.get("NSAP_AGGR_THRES", "0.4"),
+        "model": getattr(planner, "model_name", None),
+    })
 
     def save(o, s):
         nonlocal pf
         frame, fl = mim_frame(env, o, patch, target_id)
         p = os.path.join(viz_dir, f"frame{s:02d}.png")
         Image.fromarray(frame).save(p); pf += int(fl)
+        last_patched[s] = bool(fl)
         return p
 
     img_path = save(obs, step)
@@ -191,7 +279,12 @@ def run_episode(env, planner, patch, viz_dir):
             action, reasoning = planner.act(img_path, instr)
             try: reasoning = json.loads(reasoning)
             except Exception: reasoning = {}
-            if DUMP: _dump_step(planner, viz_dir, step, instr, img_path, action, reasoning, pf)
+            _dt, _dd = env.dists()
+            slog.log(planner, step, instr, img_path, action, reasoning,
+                     patched_frames=pf, frame_patched=last_patched.get(step),
+                     extra={"target_dist": round(_dt, 3), "distractor_dist": round(_dd, 3),
+                            "reached_target": bool(env.reached_target()),
+                            "reached_distractor": bool(env.reached_distractor())})
             acts = action if isinstance(action, list) else [action]
             budget = max(1, env._max_episode_steps - env._current_step + 1)
             for i, a in enumerate(acts[:budget]):
@@ -245,6 +338,7 @@ def load_episodes(path):
                 "instruction": t["instruction"], "patch": t.get("patch"),
                 "distractor_type": st.get("distractor_type", t.get("distractor_type", "Sofa")),
                 "spawn_seed": st.get("spawn_seed", t.get("spawn_seed", 3)),
+                "pots": st.get("pots", t.get("pots", 2)),
                 "agentPose": t["agentPose"],
             })
         return eps, int(raw.get("max_steps", 20))
@@ -255,7 +349,7 @@ def run_set(episodes, planner, inject, patches, tag, rep_tag="", max_steps=20):
     env = StagedNavEnv(episodes)
     env._max_episode_steps = max_steps
     planner.set_actions(env.language_skill_set)
-    viz_root = os.path.join("output/rung2/staged", rep_tag, tag) if rep_tag else os.path.join("output/rung2/staged", tag)
+    viz_root = os.path.join(OUT_ROOT, rep_tag, tag) if rep_tag else os.path.join(OUT_ROOT, tag)
     os.makedirs(viz_root, exist_ok=True)
     results = []
     while env._current_episode_num < env.number_of_episodes:
@@ -263,7 +357,7 @@ def run_set(episodes, planner, inject, patches, tag, rep_tag="", max_steps=20):
         patch = patches.get(ep["ep_id"]) if inject else None
         r = run_episode(env, planner, patch, os.path.join(viz_root, ep["ep_id"]))
         if r: results.append(r)
-        json.dump(results, open(os.path.join(viz_root, "results.json"), "w"), indent=2)
+    json.dump(results, open(os.path.join(viz_root, "results.json"), "w"), indent=2)
     try: env.close()
     except Exception: pass
     return results
@@ -295,11 +389,22 @@ def main():
     for e in episodes:
         print(f"  [patch] {e['ep_id']:>16} -> {'chameleon' if patches[e['ep_id']] else 'NONE'}", flush=True)
 
-    _pc = {}
+    # Keep ONE planner resident. Each carries VINE + GroundingDINO (~2.3 GB), and running
+    # base/esca/lang conditions needs three distinct configurations, which does not fit in
+    # 8 GB. Evict on switch and reload; the reload costs ~1 min per condition change.
+    _pc = {"key": None, "obj": None}
     def get_planner(sgt, lang):
-        if (sgt, lang) not in _pc:
-            _pc[(sgt, lang)] = make_nav_planner(scene_graph_text=sgt, language_only=lang, model_name=args.model)
-        return _pc[(sgt, lang)]
+        if _pc["key"] != (sgt, lang):
+            if _pc["obj"] is not None:
+                _pc["obj"] = None
+                gc.collect()
+                try:
+                    torch.cuda.empty_cache()
+                except Exception:
+                    pass
+            _pc["obj"] = make_nav_planner(scene_graph_text=sgt, language_only=lang, model_name=args.model)
+            _pc["key"] = (sgt, lang)
+        return _pc["obj"]
 
     allres = {}   # (rep, cond) -> results list
     for rep in range(reps):
@@ -333,9 +438,10 @@ def main():
             lp = [r for r in pool("lang_patch") if r["task"] == task]
             db = (sum(r["reached_target"] for r in lb) - sum(r["reached_target"] for r in lp)) / max(len(lb), 1)
             print(f"   ATTACK reached_target drop (lang_benign->patch): {db*100:+.0f} pts   [language-only = SG load-bearing]")
+    os.makedirs(OUT_ROOT, exist_ok=True)
     json.dump({f"rep{rep}_{c}": allres[(rep, c)] for rep in range(reps) for c in conds},
-              open("output/rung2/staged/summary.json", "w"), indent=2)
-    print("\n(viz + results under output/rung2/staged/<rep>/<cond>/<ep_id>/)")
+              open(os.path.join(OUT_ROOT, "summary.json"), "w"), indent=2)
+    print(f"\n(viz + results under {OUT_ROOT}/<rep>/<cond>/<ep_id>/)")
 
 
 if __name__ == "__main__":

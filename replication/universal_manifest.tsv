@@ -1,0 +1,7 @@
+# Stage 1 universal patches. One per head. Generated from the saved patch configs.
+head	mode	target	attribute	relation	sim_data	data_source	coverage	steps	batch	lambda_tv
+attribute_Television_displaying	attribute	Television	displaying	next to	dataset/sim	-	0.3	2000	4	0.0001
+category_coffee_machine	category	coffee machine	-	next to	dataset/sim	-	0.3	2000	4	0.0001
+category_pot	category	pot	-	next to	dataset/sim	-	0.3	2000	4	0.0001
+category_toaster	category	toaster	-	next to	dataset/sim	-	0.3	2000	4	0.0001
+relation_on_Pot	relation	Pot	-	on	dataset/sim	pot	0.3	2000	4	0.0001

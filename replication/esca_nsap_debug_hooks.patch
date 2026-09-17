@@ -1,0 +1,25 @@
+diff --git a/embodiedbench/planner/navigation/esca.py b/embodiedbench/planner/navigation/esca.py
+index d207014..31bc8a8 100644
+--- a/embodiedbench/planner/navigation/esca.py
++++ b/embodiedbench/planner/navigation/esca.py
+@@ -653,6 +653,8 @@ You are supposed to output in JSON. Note that nested quotes is not allowed. Plea
+             for oid in predicted_name:
+                 predicted_name[oid] = sorted(predicted_name[oid], reverse=True)   
+                 
++            self._nsap_predicted_name = {oid: predicted_name[oid][:4] for oid in predicted_name}  # NSAP debug: SGClip top-4 (prob,name) per box
++            self._nsap_query_names = list(query_names)                                             # NSAP debug: the classify vocab
+             reformatted_unary_res = {}
+             for unary_res in all_unary_res:
+                 for  (fid, oid, kw) in unary_res[0].keys():
+@@ -715,6 +717,11 @@ You are supposed to output in JSON. Note that nested quotes is not allowed. Plea
+                 scored = {}   # (pair, relation) -> prob   (includes the "not <rel>" contrast)
+                 for (fid, pair, rel), p in batched_image_binary_probs[0].items():
+                     scored[(pair, rel)] = p.item() if hasattr(p, 'item') else float(p)
++                # NSAP debug hook (read-only): expose the raw pair/relation scores and the
++                # oid -> top-name map so an offline probe can test alternative selection
++                # rules (e.g. argmax relation per ordered pair) without changing behaviour.
++                self._nsap_rel_scored = dict(scored)
++                self._nsap_rel_names = {oid: predicted_name[oid][0][1] for oid in predicted_name}
+                 target_rep, all_rep = {}, {}
+                 for oid in selected_objects:
+                     target_rep.setdefault(predicted_name[oid][0][1], oid)

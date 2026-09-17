@@ -21,7 +21,16 @@ from PIL import Image
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))   # rung2/
 import harness   # noqa: F401  sets sys.path (ESCA/LASER), env vars (OPENAI/GD/VINE), chdir(NSAP)
 from nav_harness import make_nav_planner                          # noqa: E402  fixed navigation.esca planner
-import nsap_inject                                                # noqa: E402
+import nsap_inject
+from step_log import StepLogger
+
+# See staged_bench: keep runs at different tau in separate trees.
+OUT_ROOT = os.environ.get("NSAP_OUT_ROOT", "output/rung2/ebnav")
+# ESCA's nav evaluator runs multistep=True, and EBNavEnv.save_image then returns the LAST 3
+# frame paths rather than one (EBNavEnv.py:374-385). The planner iterates that list, so
+# passing a single string makes it iterate the characters of the path. We inject the patch
+# ourselves and therefore save our own frames, so we must build the same 3-frame window.
+MULTISTEP = os.environ.get("NSAP_ESCA_FAITHFUL", "0") == "1"                                                # noqa: E402
 from embodiedbench.envs.eb_navigation.EBNavEnv import EBNavigationEnv   # noqa: E402  the REAL benchmark env
 
 NSAP = harness.NSAP
@@ -135,6 +144,16 @@ def run_episode(env, planner, patch, viz_dir):
     os.makedirs(viz_dir, exist_ok=True)
     pf = 0
     step = 0
+    last_patched = {}                       # step -> was that frame patched?
+    frame_paths = []                        # every saved frame, for the multistep window
+    slog = StepLogger(viz_dir, meta={
+        "runner": "eb_bench_runner", "episode": f"ep{ep_idx}_{cat}",
+        "scene": env.episode_data.get("scene"), "target": cat,
+        "instruction": instr, "viz_dir": viz_dir,
+        "patch": None if patch is None else "chameleon",
+        "aggr_thres": os.environ.get("NSAP_AGGR_THRES", "0.4"),
+        "model": getattr(planner, "model_name", None),
+    })
 
     def save(o, s):
         nonlocal pf
@@ -142,6 +161,8 @@ def run_episode(env, planner, patch, viz_dir):
         p = os.path.join(viz_dir, f"frame{s:02d}.png")
         Image.fromarray(frame).save(p)
         pf += int(fl)
+        last_patched[s] = bool(fl)
+        frame_paths.append(p)
         return p
 
     def save_grounded(s):
@@ -157,11 +178,15 @@ def run_episode(env, planner, patch, viz_dir):
     test_ct = 0
     while not done:
         try:
-            action, reasoning = planner.act(img_path, instr)
+            obs_arg = frame_paths[-3:] if MULTISTEP else img_path
+            action, reasoning = planner.act(obs_arg, instr)
             try: reasoning = json.loads(reasoning)
             except Exception: reasoning = {}
             save_grounded(step)
-            _dump_step(planner, viz_dir, step, instr, img_path, action, reasoning, pf)
+            slog.log(planner, step, instr, img_path, action, reasoning,
+                     patched_frames=pf, frame_patched=last_patched.get(step),
+                     extra={"agent_position": env.env.last_event.metadata["agent"]["position"]
+                            if hasattr(env, "env") else None})
             acts = action if isinstance(action, list) else [action]
             budget = max(1, env._max_episode_steps - env._current_step + 1)
             for i, a in enumerate(acts[:budget]):
@@ -197,7 +222,7 @@ def run_set(eval_set, indices, planner, inject, patches, model, tag, rep_tag="")
     # RELATIVE to cwd (=NSAP, set by harness): the planner derives its *_bbox.png path via
     # os.path.join(*image_path.split('/')), which drops the leading slash of an ABSOLUTE path
     # and turns it relative -> FileNotFoundError. Relative paths sidestep that entirely.
-    viz_root = os.path.join("output/rung2/ebnav", rep_tag, tag, eval_set)
+    viz_root = os.path.join(OUT_ROOT, rep_tag, tag, eval_set)
     results = []
     while env._current_episode_num < env.number_of_episodes:
         ep_peek = env.selected_indexes[env._current_episode_num]
@@ -266,8 +291,9 @@ def main():
             tgt = next((r["target"] for c in conds for r in pool(eval_set, c) if r["episode"] == idx), "?")
             print(f"   {idx:>3} {tgt:13} {kinds.get(idx,'?'):10} " + " ".join(f"{x:>8}" for x in cells))
         summary[eval_set] = {c: f"{sr[c]:.0f}/{tot}" for c in conds}
-    json.dump(summary, open("output/rung2/ebnav/summary.json", "w"), indent=2)
-    print("\n(viz + per-episode results under output/rung2/ebnav/<rep>/<cond>/<eval_set>/)")
+    os.makedirs(OUT_ROOT, exist_ok=True)
+    json.dump(summary, open(os.path.join(OUT_ROOT, "summary.json"), "w"), indent=2)
+    print(f"\n(viz + per-episode results under {OUT_ROOT}/<rep>/<cond>/<eval_set>/)")
 
 
 if __name__ == "__main__":

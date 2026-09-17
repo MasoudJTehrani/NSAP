@@ -41,13 +41,24 @@ HF_TOKEN = os.environ.get("HF_TOKEN")
 HF_DATA_ID        = "MasoudJTehrani/NSAP-sim-data"
 # Pinned to the dataset commit sha for EXACT reproducibility (a mutable branch like
 # 'main' would drift if the repo is ever changed). Override with $NSAP_DATA_REVISION.
-HF_DATA_REVISION  = os.environ.get("NSAP_DATA_REVISION", "cfc526c9d27c9ba16f8df097da2490abe0acce2b")
+# This sha adds the dataset card on top of cfc526c9, which is the revision the paper's
+# artifacts were built from; the data files are identical between the two.
+HF_DATA_REVISION  = os.environ.get("NSAP_DATA_REVISION", "750f0213d1a7945014d53bfff03d9a8a63641c42")
 SIM_DATA_DIR      = ROOT / "dataset" / "sim"
 # The EB-Nav deployment scenes (kitchen_ebnav) live in the SAME dataset repo under a
 # kitchen_ebnav/ subfolder, fetched as a sibling of sim (used by the category
 # chameleons and the MIM). See download_dataset().
 EBNAV_DATA_DIR    = ROOT / "dataset" / "kitchen_ebnav"
 SIM_DATA_SENTINEL = DATASET_DIR / ".sim_data_downloaded"
+
+# --- Trained patches + benchmark run logs (the artifacts a replicator cannot regenerate) ---
+# Retraining gives different patches and re-running the benchmark gives different
+# trajectories, so the exact artifacts behind the paper's numbers are published separately.
+# Set $NSAP_ARTIFACTS_ID / $NSAP_ARTIFACTS_REVISION to point at a different copy.
+HF_ARTIFACTS_ID        = os.environ.get("NSAP_ARTIFACTS_ID", "MasoudJTehrani/NSAP-artifacts")
+HF_ARTIFACTS_REVISION  = os.environ.get("NSAP_ARTIFACTS_REVISION",
+                                        "59b3f2e9126a1894d583220daf260d07cda9401d")
+ARTIFACTS_SENTINEL     = DATASET_DIR / ".artifacts_downloaded"
 
 
 def _require_hf_hub():
@@ -196,6 +207,34 @@ def download_dataset(revision: str | None = None) -> None:
     SIM_DATA_SENTINEL.touch()
     print(f"  Saved to: {SIM_DATA_DIR}  and  {EBNAV_DATA_DIR}")
 
+
+
+def download_artifacts(revision: str | None = None) -> None:
+    """Download the trained patches and benchmark run logs from the HF Hub.
+
+    Lays them out exactly where the evaluation scripts expect:
+        output/universal_patches/   output/chameleon_patches/
+        output/rung2/               output/*.json
+    Idempotent (sentinel-guarded). Delete dataset/.artifacts_downloaded to force a refetch.
+    """
+    hf = _require_hf_hub()
+    if ARTIFACTS_SENTINEL.exists():
+        print("  Artifacts already present, skipping.")
+        return
+    rev = revision or HF_ARTIFACTS_REVISION
+    out = ROOT / "output"
+    out.mkdir(parents=True, exist_ok=True)
+    print(f"  Downloading artifacts {HF_ARTIFACTS_ID}@{rev} -> {out} ...")
+    hf.snapshot_download(
+        repo_id=HF_ARTIFACTS_ID,
+        repo_type="dataset",
+        revision=rev,
+        local_dir=str(out),
+        token=HF_TOKEN,
+    )
+    DATASET_DIR.mkdir(parents=True, exist_ok=True)
+    ARTIFACTS_SENTINEL.touch()
+    print(f"  Saved to: {out}")
 
 def main(include_detection: bool = False) -> None:
     hf = _require_hf_hub()
