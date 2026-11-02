@@ -118,18 +118,34 @@ def main():
     ap.add_argument("--out", default="output/stealth_eval.json")
     ap.add_argument("--coverage", type=float, default=0.5,
                     help="force both patch types to this coverage so the comparison is size-matched")
+    ap.add_argument("--arms", default="",
+                    help="comma-separated ablation arms to score instead of the two patch types")
     a = ap.parse_args()
     global COVERAGE
     COVERAGE = a.coverage
     print(f"  coverage forced to {COVERAGE} for BOTH patch types (size-matched)\n", flush=True)
 
     jobs = []
-    for p in sorted(glob.glob("output/chameleon_patches/*/*/*/*_final.pt")):
-        sid = p.split("/")[3]
-        sd = ("SceneGraphBench/data/kitchen_ebnav" if sid.startswith("ebnav_scenario") else a.sim_data)
-        jobs.append((p, sid.replace("ebnav_", ""), sd, "chameleon"))
-    for p in sorted(glob.glob("output/universal_patches/*/*_final.pt")):
-        jobs.append((p, "", a.sim_data, "universal"))
+    if a.arms:
+        for arm in a.arms.split(","):
+            arm = arm.strip()
+            if not arm:
+                continue
+            root = arm if os.sep in arm else f"output/ablation_patches/{arm}"
+            found = sorted(glob.glob(f"{root}/*/*/*/*_final.pt"))
+            if not found:
+                print(f"  !! no patches under {root}", flush=True)
+            for p in found:
+                sid = p.split("/")[-3]
+                sd = ("SceneGraphBench/data/kitchen_ebnav" if sid.startswith("ebnav_scenario") else a.sim_data)
+                jobs.append((p, sid.replace("ebnav_", ""), sd, os.path.basename(root.rstrip("/"))))
+    else:
+        for p in sorted(glob.glob("output/chameleon_patches/*/*/*/*_final.pt")):
+            sid = p.split("/")[3]
+            sd = ("SceneGraphBench/data/kitchen_ebnav" if sid.startswith("ebnav_scenario") else a.sim_data)
+            jobs.append((p, sid.replace("ebnav_", ""), sd, "chameleon"))
+        for p in sorted(glob.glob("output/universal_patches/*/*_final.pt")):
+            jobs.append((p, "", a.sim_data, "universal"))
 
     rows = []
     for path, sid, sd, kind in jobs:

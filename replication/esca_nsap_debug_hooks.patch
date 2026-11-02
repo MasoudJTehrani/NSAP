@@ -1,8 +1,40 @@
 diff --git a/embodiedbench/planner/navigation/esca.py b/embodiedbench/planner/navigation/esca.py
-index d207014..31bc8a8 100644
+index d207014..3ab77c6 100644
 --- a/embodiedbench/planner/navigation/esca.py
 +++ b/embodiedbench/planner/navigation/esca.py
-@@ -653,6 +653,8 @@ You are supposed to output in JSON. Note that nested quotes is not allowed. Plea
+@@ -579,6 +579,7 @@ You are supposed to output in JSON. Note that nested quotes is not allowed. Plea
+                       query_names,
+                       query_attributes,
+                       query_relation_kws=None,
++                      gd_labels=None,
+                       ):
+ 
+         # Preprocess query attributes for the case where one object having multiple attribute
+@@ -602,7 +603,22 @@ You are supposed to output in JSON. Note that nested quotes is not allowed. Plea
+                 _binary_kws += [_r, f"not {_r}"]
+             _n = len(batched_pred_masks)
+             if _binary_kws and _n >= 2:
+-                _pairs = [(i, j) for i in range(_n) for j in range(_n) if i != j][:60]
++                # NSAP: the binary head scores at most 60 ordered pairs. Taken in
++                # detection-index order that budget is spent on the first two or three
++                # detections, so the pairs of the object the instruction is about are
++                # often never scored at all. Score those first.
++                _all = [(i, j) for i in range(_n) for j in range(_n) if i != j]
++                _tn = [str(t).lower() for t in (target_names or []) if str(t).strip()]
++                _tgt = {i for i, lb in enumerate(gd_labels or [])
++                        if any(t in str(lb).lower() or str(lb).lower() in t for t in _tn)}
++                # Off by default, so the pair set matches the runs the paper reports.
++                # $NSAP_REL_PAIR_PRIORITY=1 scores the instructed object's pairs first.
++                if os.environ.get("NSAP_REL_PAIR_PRIORITY", "0") == "1":
++                    _pri = [q for q in _all if q[0] in _tgt or q[1] in _tgt]
++                    _seen = set(_pri)
++                    _pairs = (_pri + [q for q in _all if q not in _seen])[:60]
++                else:
++                    _pairs = _all[:60]
+                 _obj_pairs = [(0, 0, (i, j)) for (i, j) in _pairs]
+                 _bpred = [None]   # score exactly the pairs passed
+             else:
+@@ -653,6 +669,8 @@ You are supposed to output in JSON. Note that nested quotes is not allowed. Plea
              for oid in predicted_name:
                  predicted_name[oid] = sorted(predicted_name[oid], reverse=True)   
                  
@@ -11,7 +43,7 @@ index d207014..31bc8a8 100644
              reformatted_unary_res = {}
              for unary_res in all_unary_res:
                  for  (fid, oid, kw) in unary_res[0].keys():
-@@ -715,6 +717,11 @@ You are supposed to output in JSON. Note that nested quotes is not allowed. Plea
+@@ -715,6 +733,11 @@ You are supposed to output in JSON. Note that nested quotes is not allowed. Plea
                  scored = {}   # (pair, relation) -> prob   (includes the "not <rel>" contrast)
                  for (fid, pair, rel), p in batched_image_binary_probs[0].items():
                      scored[(pair, rel)] = p.item() if hasattr(p, 'item') else float(p)
@@ -23,3 +55,27 @@ index d207014..31bc8a8 100644
                  target_rep, all_rep = {}, {}
                  for oid in selected_objects:
                      target_rep.setdefault(predicted_name[oid][0][1], oid)
+@@ -731,7 +754,14 @@ You are supposed to output in JSON. Note that nested quotes is not allowed. Plea
+                             off_s = scored.get(((soid, ooid), f"not {_r}"))
+                             if on_s is not None and (off_s is None or on_s > off_s):
+                                 cand.append((on_s, oname))
+-                        for _sc, oname in sorted(cand, reverse=True)[:2]:
++                        # NSAP: how many relations to surface per subject. Default 2, as
++                        # before. $NSAP_REL_TOPN=0 keeps every candidate that beats its own
++                        # negation, which is the condition the relation attack optimises
++                        # against, so a missing edge then means the attack removed it rather
++                        # than that a louder edge outranked it.
++                        _topn = int(os.environ.get("NSAP_REL_TOPN", "2"))
++                        _ranked = sorted(cand, reverse=True)
++                        for _sc, oname in (_ranked if _topn <= 0 else _ranked[:_topn]):
+                             if (sname, _r, oname) in seen:
+                                 continue
+                             seen.add((sname, _r, oname))
+@@ -907,6 +937,7 @@ You are supposed to output in JSON. Note that nested quotes is not allowed. Plea
+                       query_names=query_objects,
+                       query_attributes=target_attributes,
+                       query_relation_kws=target_relation_kws,
++                      gd_labels=labels,
+                       )
+                 
+             if self.boundingbox:

@@ -27,6 +27,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import harness   # noqa: F401
 from nav_harness import make_nav_planner   # noqa: E402
 import nsap_inject
+import frame_cache
 from step_log import StepLogger
 
 # Output root. Runs at different tau (or different variants) must not overwrite each
@@ -163,6 +164,10 @@ class StagedNavEnv(EBNavigationEnv):
             return {"x": q["x"], "y": q["y"], "z": q["z"]}
         self.episode_data["target_position"] = nearest_reachable(tgt["position"]) if tgt else None
         self._distractor_pos = nearest_reachable(dist["position"]) if dist else None
+        # Freeze the world before the agent is placed: AI2-THOR keeps simulating physics
+        # and objects drift centimetres between resets, which is what made runs
+        # irreproducible. No-op unless the frame cache is enabled.
+        frame_cache.freeze_physics(self)
         pose = ep["agentPose"]
         self.env.step(action="Teleport", position=pose["position"],
                       rotation={"x": 0, "y": pose["rotation"], "z": 0}, horizon=pose["horizon"], standing=True)
@@ -201,7 +206,9 @@ class StagedNavEnv(EBNavigationEnv):
 
 
 def mim_frame(env, obs, patch, target_id):
-    frame = np.array(obs["head_rgb"]).astype(np.uint8)
+    # The clean frame comes from the pose cache when NSAP_FRAME_CACHE is set, so two runs
+    # standing in the same place see identical pixels and differ only by the patch below.
+    frame = frame_cache.clean_frame(env, obs)
     if patch is None or target_id is None:
         return frame, False
     bbox = (env.env.last_event.instance_detections2D or {}).get(target_id)
@@ -251,6 +258,10 @@ def run_episode(env, planner, patch, viz_dir):
         return None
     target_id = env.episode_data["targetObjectIds"]
     instr = env.episode_language_instruction
+    # Tell the planner which episode this is, so a pinned vocabulary is shared by every
+    # run, condition and repetition of it rather than re-sampled each time (see
+    # NSAP_PIN_VOCAB in the ESCA planner).
+    os.environ["NSAP_EPISODE_ID"] = str(env.episode_data.get("ep_id") or "episode")
     planner.reset()
     os.makedirs(viz_dir, exist_ok=True)
     pf = 0; step = 0
@@ -304,6 +315,7 @@ def run_episode(env, planner, patch, viz_dir):
            "scene": env.episode_data["scene"], "reached_target": int(rt), "reached_distractor": int(rd),
            "dist_target": round(dt, 2), "dist_distractor": round(dd, 2),
            "steps": env._current_step, "frames_with_patch": pf}
+    frame_cache.report()
     print(f"    {res['episode']:>16} {'TGT' if rt else '   '} {'DISTR' if rd else '     '}  "
           f"dT={dt:.1f} dD={dd:.1f} steps={res['steps']:>2} pf={pf}", flush=True)
     return res

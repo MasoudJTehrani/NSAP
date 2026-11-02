@@ -5,8 +5,11 @@
 #   bash replicate.sh fetch-artifacts  download our trained patches + run logs (skip training)
 #   bash replicate.sh train-universal  Stage 1: 5 universal patches      (~5 h on one GPU)
 #   bash replicate.sh train-chameleon  Stage 2: 30 per-scenario patches  (~4 h)
+#   bash replicate.sh train-ablation   content-loss ablation: 60 patches           (~1.5 h)
+#   bash replicate.sh eval-ablation    flip rate and LPIPS for both ablation arms  (~1 h)
 #   bash replicate.sh eval-model       model-level: outcome, deployment, stealth   (~2 h)
 #   bash replicate.sh eval-system      system-level: staged + EB-Nav benchmarks    (~36 h, paid API)
+#   bash replicate.sh numbers          recompute every paper number from output/  (seconds)
 #   bash replicate.sh all              everything above, in order
 #
 #   DRY_RUN=1 bash replicate.sh train-chameleon     print the commands, run nothing
@@ -40,6 +43,10 @@ DRY_RUN="${DRY_RUN:-0}"
 say()  { printf '\n\033[1m== %s\033[0m\n' "$*"; }
 run()  { if [ "$DRY_RUN" = "1" ]; then printf '  %s\n' "$*"; else printf '  + %s\n' "$*"; eval "$@"; fi; }
 die()  { printf '\033[31mERROR: %s\033[0m\n' "$*" >&2; exit 1; }
+# Like run(), but a failure is reported and the loop continues. Used by the ablation,
+# where one unusable scenario should not discard the other fifty-nine patches.
+run_ok() { if [ "$DRY_RUN" = "1" ]; then printf '  %s\n' "$*"; else printf '  + %s\n' "$*"
+           eval "$@" || printf '\033[31m  !! FAILED, continuing\033[0m\n'; fi; }
 
 # The EB-Nav scenes live under SceneGraphBench/data when generated locally and under
 # dataset/ when downloaded from the Hub. Accept either.
@@ -126,13 +133,21 @@ stage_train_chameleon() {
     [ -n "$only" ] && [[ "$head" != *"$only"* ]] && continue
     [ -f "$init_patch" ] || die "missing Stage 1 patch $init_patch (run train-universal, or fetch-artifacts)"
     # The manifest records where the EB-Nav scenes sat when we trained; resolve it here.
-    [ "$sim_data" = "SceneGraphBench/data/kitchen_ebnav" ] && sim_data="$ebnav"
+    # It also labels those rows `ebnav_<id>` to keep the output paths distinct, but the
+    # dataset's own ids carry no prefix, so strip it before passing --only-scenario.
+    local sid="$scenario"
+    if [ "$sim_data" = "SceneGraphBench/data/kitchen_ebnav" ]; then
+      sim_data="$ebnav"; sid="${scenario#ebnav_}"
+    fi
+    if [ -f "output/chameleon_patches/$head/$scenario/$head/${head}_final.pt" ]; then
+      echo "--- $head / $scenario  (already trained, skipping)"; continue
+    fi
     local extra=""
     [ "$attribute" != "-" ] && extra="$extra --attribute '$attribute'"
     [ "$mode" = "relation" ] && extra="$extra --relation '$relation'"
     echo "--- $head / $scenario"
     run "'$PY_NSAP' run_attack.py --mode '$mode' --target '$target'$extra \
-      --sim-data '$sim_data' --only-scenario '$scenario' \
+      --sim-data '$sim_data' --only-scenario '$sid' \
       --init-patch '$init_patch' --object-init --lambda-content '$lambda_content' \
       --steps '$steps' --batch 1 --eot-crops '$eot_crops' --coverage '$coverage' \
       --lambda-tv 0 --no-chameleon --seed 0 \
@@ -140,14 +155,64 @@ stage_train_chameleon() {
   done
 }
 
+# The content loss and the object initialisation are what make a Stage-2 patch a
+# chameleon. Comparing chameleons against the Stage-1 universal patches cannot isolate
+# either, because those differ in six ways at once (loss, initialisation, steps,
+# coverage, training data and evaluation split). These arms change one thing at a time,
+# on the same scenarios, from the same Stage-1 anchor, with the same steps, coverage,
+# crops and seed as the chameleon they are compared against:
+#
+#   content0   object-init, lambda_content 0   -> the content loss alone (chameleon vs this)
+#   noinit     no object-init, lambda_content 0 -> initialisation alone (content0 vs this)
+#
+stage_train_ablation() {
+  local only="${1:-}"
+  local ebnav; ebnav=$(resolve_ebnav)
+  say "Content-loss ablation: arms content0 and noinit (replication/chameleon_manifest.tsv)"
+  for arm in content0 noinit; do
+    local initflag="--object-init"
+    [ "$arm" = "noinit" ] && initflag=""
+    grep -v '^#' replication/chameleon_manifest.tsv | tail -n +2 |
+    while IFS=$'\t' read -r head scenario mode target attribute relation sim_data coverage lambda_content steps eot_crops init_patch; do
+      [ -n "${head:-}" ] || continue
+      [ -n "$only" ] && [[ "$head" != *"$only"* ]] && continue
+      [ -f "$init_patch" ] || die "missing Stage 1 patch $init_patch (run train-universal, or fetch-artifacts)"
+      local sid="$scenario"
+      if [ "$sim_data" = "SceneGraphBench/data/kitchen_ebnav" ]; then
+        sim_data="$ebnav"; sid="${scenario#ebnav_}"
+      fi
+      if [ -f "output/ablation_patches/$arm/$head/$scenario/$head/${head}_final.pt" ]; then
+        echo "--- [$arm] $head / $scenario  (already trained, skipping)"; continue
+      fi
+      local extra=""
+      [ "$attribute" != "-" ] && extra="$extra --attribute '$attribute'"
+      [ "$mode" = "relation" ] && extra="$extra --relation '$relation'"
+      echo "--- [$arm] $head / $scenario"
+      run_ok "'$PY_NSAP' run_attack.py --mode '$mode' --target '$target'$extra \
+        --sim-data '$sim_data' --only-scenario '$sid' \
+        --init-patch '$init_patch' $initflag --lambda-content 0 \
+        --steps '$steps' --batch 1 --eot-crops '$eot_crops' --coverage '$coverage' \
+        --lambda-tv 0 --no-chameleon --seed 0 \
+        --output-dir 'output/ablation_patches/$arm/$head/$scenario'"
+    done
+  done
+}
+
+stage_eval_ablation() {
+  say "Content-loss ablation: flip rate and LPIPS for both arms"
+  run "'$PY_NSAP' rung2/outcome_eval.py --arms content0,noinit --masks gt \
+    --out output/ablation_outcome.json"
+  run "'$PY_NSAP' rung2/stealth_eval.py --coverage 0.5 --arms content0,noinit \
+    --out output/ablation_stealth.json"
+}
+
 # ---------------------------------------------------------------- model level
 
 stage_eval_model() {
-  say "Model level: per-head outcomes, ground-truth masks"
-  run "'$PY_NSAP' rung2/outcome_eval.py --all --masks gt   --out output/outcome_eval.json"
-
-  say "Model level: same, with SAM2 masks (does the mask source change the answer?)"
-  run "'$PY_NSAP' rung2/outcome_eval.py --all --masks sam2 --out output/outcome_eval_sam2.json"
+  # --all runs every patch under BOTH mask sources (ground truth and SAM2) into one file,
+  # so the SAM2 comparison needs no separate call.
+  say "Model level: per-head outcomes, ground-truth and SAM2 masks"
+  run "'$PY_NSAP' rung2/outcome_eval.py --all --out output/outcome_eval.json"
 
   say "Deployment-faithful scoring, detector-driven"
   run "'$PY_EMB' rung2/deploy_eval.py --all-chameleons --out output/deploy_eval.json"
@@ -188,7 +253,7 @@ stage_eval_system() {
   run "bash rung2/run_staged_variants.sh A_donothing attribute,relation 3 0.1 1 base_benign,esca_benign,esca_patch,lang_benign,lang_patch"
 
   say "Single-pot staging variant: one pot, one differently-typed distractor  ~6.3 h"
-  run "bash rung2/run_staged_variants.sh E_single_pot relation 5 0.4 1"
+  run "bash rung2/run_staged_variants.sh E_single_pot attribute,relation 5 0.4 1"
 
   say "Category, EB-Nav, ESCA's own navigation evaluator config (gd_only, SGClip skipped)  ~1.8 h"
   run "bash rung2/run_category.sh 0.3 3 1 1"
@@ -200,6 +265,13 @@ stage_eval_system() {
   run "bash rung2/run_category.sh 0.4 3 0 0"
 }
 
+# ---------------------------------------------------------------- numbers
+
+stage_numbers() {
+  say "Every number the paper cites, recomputed from output/ with its source"
+  run "'$PY_NSAP' rung2/paper_numbers.py --out output/NUMBERS.md"
+}
+
 # ---------------------------------------------------------------- dispatch
 
 case "${1:-}" in
@@ -207,9 +279,12 @@ case "${1:-}" in
   fetch-artifacts)  stage_fetch_artifacts ;;
   train-universal)  stage_train_universal "${2:-}" ;;
   train-chameleon)  stage_train_chameleon "${2:-}" ;;
+  train-ablation)   stage_train_ablation "${2:-}" ;;
+  eval-ablation)    stage_eval_ablation ;;
   eval-model)       stage_eval_model ;;
   eval-system)      stage_eval_system ;;
+  numbers)          stage_numbers ;;
   all)              stage_setup; stage_train_universal; stage_train_chameleon
-                    stage_eval_model; stage_eval_system ;;
-  *) sed -n '2,22p' "$0" | sed 's/^# \?//' ; exit 1 ;;
+                    stage_eval_model; stage_eval_system; stage_numbers ;;
+  *) sed -n '2,23p' "$0" | sed 's/^# \?//' ; exit 1 ;;
 esac

@@ -22,6 +22,30 @@ import os
 import time
 
 
+
+def _rel_scores(planner, top=10):
+    """-> {subject name: [[object name, p(rel), p(not rel), rel], ...]} sorted by p(rel)."""
+    scored = getattr(planner, "_nsap_rel_scored", None)
+    names = getattr(planner, "_nsap_rel_names", None)
+    if not scored or not names:
+        return None
+    pos, neg = {}, {}
+    for (pair, rel), p in scored.items():
+        try:
+            s_, o_ = pair
+        except Exception:
+            continue
+        (neg if str(rel).startswith("not ") else pos)[(s_, o_, str(rel).replace("not ", "", 1))] = float(p)
+    out = {}
+    for (s_, o_, rel), p in pos.items():
+        sn, on = names.get(s_), names.get(o_)
+        if sn is None or on is None or sn == on:
+            continue
+        out.setdefault(str(sn), []).append([str(on), round(p, 4), round(neg.get((s_, o_, rel), float("nan")), 4), rel])
+    for k in out:
+        out[k] = sorted(out[k], key=lambda r: -r[1])[:top]
+    return out or None
+
 def _jsonable(o, _depth=0):
     """Best-effort conversion to something json.dump can write. Never raises."""
     if _depth > 12:
@@ -89,6 +113,11 @@ class StepLogger:
                 "grounded_relations": _g(planner, "_nsap_last_relations"),
                 "per_box_topk": _g(planner, "_nsap_predicted_name"),
                 "query_names": _g(planner, "_nsap_query_names"),
+                # Per subject, every candidate object scored for the requested relation,
+                # with the probability of the relation and of its negation. This is what
+                # decides whether an edge is surfaced, so a missing edge can be traced to
+                # the score rather than guessed at.
+                "relation_scores": _rel_scores(planner),
             },
             "scene_graph_text": _g(planner, "_nsap_last_sg_text"),
             "mllm": reasoning if isinstance(reasoning, dict) else {"raw": reasoning},

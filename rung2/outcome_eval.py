@@ -250,6 +250,8 @@ def main():
     ap.add_argument("--split", default="test")
     ap.add_argument("--viz", action="store_true")
     ap.add_argument("--all", action="store_true")
+    ap.add_argument("--arms", default="",
+                    help="comma-separated ablation arms to score instead of --all; a bare name\n                         means output/ablation_patches/<name>, or give a path")
     ap.add_argument("--out", default="output/outcome_eval.json")
     a = ap.parse_args()
 
@@ -257,7 +259,24 @@ def main():
     vine = load_vine(DEV)
 
     jobs = []
-    if a.all:
+    if a.arms:
+        # Content-loss ablation: each arm is a directory of per-scenario Stage-2 patches
+        # laid out exactly like output/chameleon_patches, so the same scenario id is
+        # comparable across arms.
+        for arm in a.arms.split(","):
+            arm = arm.strip()
+            if not arm:
+                continue
+            root = arm if os.sep in arm else f"output/ablation_patches/{arm}"
+            found = sorted(glob.glob(f"{root}/*/*/*/*_final.pt"))
+            if not found:
+                print(f"  !! no patches under {root}", flush=True)
+            for p in found:
+                sid = p.split("/")[-3]
+                sd = ("SceneGraphBench/data/kitchen_ebnav" if sid.startswith("ebnav_scenario")
+                      else a.sim_data)
+                jobs.append((p, sid.replace("ebnav_", ""), sd, os.path.basename(root.rstrip("/"))))
+    elif a.all:
         for p in sorted(glob.glob("output/chameleon_patches/*/*/*/*_final.pt")):
             sid = p.split("/")[3]
             sd = ("SceneGraphBench/data/kitchen_ebnav" if sid.startswith("ebnav_scenario")

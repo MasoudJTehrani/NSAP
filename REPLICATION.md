@@ -38,11 +38,14 @@ at a pinned revision. From there `eval-model` reproduces every
 model-level number in the paper, and `rung2/analyze_steps.py <run-dir>` reproduces the
 per-step analysis without spending a cent on the API. This is the path we recommend.
 
+`bash replicate.sh numbers` recomputes every number the paper cites from `output/` in a few seconds, and
+writes `output/NUMBERS.md` with the source file next to each one.
+
 **Retrain from scratch.** `train-universal` then `train-chameleon`. The recipes are not
 buried in the scripts: `replication/universal_manifest.tsv` and
 `replication/chameleon_manifest.tsv` were generated from the `AttackConfig` stored inside
 each saved patch, so they are a record of what actually ran rather than a description of it.
-Stage 2 warm-starts from Stage 1, so the order matters.
+Stage 2 needs Stage 1 first: each chameleon takes its size and position from the universal patch for its head, though its pixels start from the object itself, not from the universal patch.
 
 ## What replicates, and what does not
 
@@ -56,8 +59,9 @@ stealth numbers should all come back the same.
 
 **Does not replicate exactly.** The embodied benchmark. gpt-4o is not deterministic at the
 temperature ESCA uses, and the episode outcome is a long chain of sampled decisions. We
-measured this directly: across six sessions with an identical configuration, the unattacked
-`base_benign` baseline ranged from 0% to 44% success. Two runs of one configuration are
+measured this directly: two runs of the relation tasks with identical instructions, staging and
+settings disagreed on the sign of both the scene graph's benefit (-16 then +13 points) and the
+attack's effect (+2 then -18 points). Both runs are in the published logs. Two runs of one configuration are
 therefore kept in `eval-system` on purpose, and the published logs keep both.
 
 Read the system-level results as the paper reads them: as an analysis of what happens to the
